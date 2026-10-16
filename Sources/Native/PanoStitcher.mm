@@ -642,7 +642,9 @@ NSArray<NSNumber *> *arrayFrom(const Matx33d &R) {
     double blendWidth = std::sqrt((double)eq.W * eq.H) * 5.0 / 100.0;
     int bands = std::max(1, (int)std::ceil(std::log2(blendWidth)));
     cv::detail::MultiBandBlender blender(false, bands);
-    blender.prepare(cv::Rect(0, 0, eq.W, eq.H));
+    int pad = std::max(1 << bands, eq.W / 8);  // (a margin each side of the +-180 edge: a piece near one edge is fed again
+    // a whole turn away, with the same seam, so the pyramid blends the true neighbours there; GCam wrapped its collapse)
+    blender.prepare(cv::Rect(-pad, 0, eq.W + 2 * pad, eq.H));
     for (int k = 0; k < np; k++) {
         cv::UMat dilated, seamUp, m;
         cv::dilate(seamMasks[k], dilated, cv::Mat());
@@ -651,13 +653,15 @@ NSArray<NSNumber *> *arrayFrom(const Matx33d &R) {
         cv::UMat img16;
         imgs[k].convertTo(img16, CV_16S);
         blender.feed(img16, m, corners[k]);
+        if (corners[k].x < pad) blender.feed(img16, m, cv::Point(corners[k].x + eq.W, corners[k].y));
+        if (corners[k].x + img16.cols > eq.W - pad) blender.feed(img16, m, cv::Point(corners[k].x - eq.W, corners[k].y));
         imgs[k].release();
         report(0.84 + 0.1 * (k + 1) / np, @"blending");
     }
     Mat result16, resultMask;
     blender.blend(result16, resultMask);
     Mat result;
-    result16.convertTo(result, CV_8U);
+    result16(cv::Rect(pad, 0, eq.W, eq.H)).convertTo(result, CV_8U);
     result.setTo(cv::Scalar(0, 0, 0), coverage == 0);  // (what no photo covered: black, as GCam left its holes)
 
     // ---- crop: a full circle keeps its width and loses rows not fully covered (10 deg at most each end); a partial

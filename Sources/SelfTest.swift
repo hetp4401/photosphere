@@ -48,6 +48,10 @@ final class SelfTestModel: ObservableObject {
                 self.images = zip(thumbs, priors).map { ($0, Orient.matrix($1.map { $0.doubleValue })) }
                 self.status = "\(paths.count) synthetic photos, stitching"
             }
+            let args = CommandLine.arguments
+            if let i = args.firstIndex(of: "-mosaicseconds"), i + 1 < args.count, let secs = Double(args[i + 1]) {
+                try? await Task.sleep(nanoseconds: UInt64(secs * 1e9))
+            }
             do {
                 let raw = (dir as NSString).appendingPathComponent("result.jpg")
                 let res = try PanoStitcher.stitchImages(paths, rotations: priors, focalPx: focal, outputWidth: 4096, outputPath: raw) { f, s in

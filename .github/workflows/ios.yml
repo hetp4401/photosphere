@@ -53,7 +53,7 @@ jobs:
           APP=$(find build/sim/Build/Products -name "PhotoSphere.app" -maxdepth 2 | head -1)
           xcrun simctl install "$DEV" "$APP"
           mkdir -p shots
-          xcrun simctl launch "$DEV" "$BUNDLE" -selftest
+          xcrun simctl launch "$DEV" "$BUNDLE" -selftest -mosaicseconds 14
           CONT=$(xcrun simctl get_app_container "$DEV" "$BUNDLE" data)
           echo "data container: $CONT"
           sleep 9; xcrun simctl io "$DEV" screenshot shots/1-mosaic.png
