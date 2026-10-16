@@ -70,6 +70,8 @@ final class CaptureSession {
         return Self.upright(upright, maxSide: 512)
     }
 
+    func setHeading(_ deg: Double) { info.headingDeg = deg }
+
     func removeLast() {
         guard let last = info.shots.popLast() else { return }
         try? FileManager.default.removeItem(at: dir.appendingPathComponent(last.file))

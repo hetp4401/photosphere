@@ -242,10 +242,11 @@ final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelega
         world.fix(refFromDevice: refFromDevice)
         let R = world.worldFromCam(refFromDevice: refFromDevice)
         let roll = Orient.roll(R)
-        lockedRoll = [0.0, .pi / 2, -.pi / 2, .pi].min { abs($0 - roll) < abs($1 - roll) }
+        let uprights: [Double] = [0, .pi / 2, -.pi / 2, .pi]
+        lockedRoll = uprights.min(by: { abs($0 - roll) < abs($1 - roll) })
         targets = TargetManager(hfov: hfov, vfov: vfov)
         overlay.clearDots()
-        if let h = heading { session.info.headingDeg = h }
+        if let h = heading { session.setHeading(h) }
         takePhoto(rotation: R)
     }
 
