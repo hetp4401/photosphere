@@ -30,10 +30,13 @@ double deg(double r) { return r * 180.0 / kPi; }
 double rad(double d) { return d * kPi / 180.0; }
 double clamp1(double v) { return std::max(-1.0, std::min(1.0, v)); }
 
+/// Rodrigues: the rotation of angle |w| about w.
 Matx33d expSO3(const Vec3d &w) {
-    Matx33d R;
-    cv::Rodrigues(w, R);
-    return R;
+    double a = cv::norm(w);
+    if (a < 1e-12) return Matx33d::eye();
+    Vec3d k = w * (1.0 / a);
+    Matx33d K(0, -k[2], k[1], k[2], 0, -k[0], -k[1], k[0], 0);
+    return Matx33d::eye() + K * std::sin(a) + K * K * (1 - std::cos(a));
 }
 
 double angleOf(const Matx33d &R) { return std::acos(clamp1((cv::trace(R) - 1.0) / 2.0)); }
@@ -610,7 +613,9 @@ NSArray<NSNumber *> *arrayFrom(const Matx33d &R) {
     report(0.72, @"matching exposure");
     try {  // (GCam: one gamma an image from the overlaps' mean luma; here one gain an image, the same idea)
         cv::detail::GainCompensator comp;
-        comp.feed(corners, imgs, masks);
+        std::vector<std::pair<cv::UMat, uchar>> maskPairs;
+        for (auto &m : masks) maskPairs.push_back({m, 255});
+        comp.feed(corners, imgs, maskPairs);
         for (int k = 0; k < np; k++) comp.apply(k, corners[k], imgs[k], masks[k]);
     } catch (const std::exception &) {
     }
