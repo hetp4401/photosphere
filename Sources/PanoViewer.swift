@@ -40,7 +40,7 @@ struct PanoViewer: UIViewRepresentable {
             m.lightingModel = .constant
             sphere.firstMaterial = m
             let node = SCNNode(geometry: sphere)
-            node.eulerAngles.y = 0  // (the texture's centre, longitude 0, ahead: along -z)
+            node.eulerAngles.y = .pi  // (the texture's centre, longitude 0, ahead: along -z)
             scene.rootNode.addChildNode(node)
             let cam = SCNCamera()
             cam.zNear = 0.1
