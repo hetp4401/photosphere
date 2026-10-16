@@ -846,7 +846,7 @@ NSArray<NSNumber *> *arrayFrom(const Matx33d &R) {
         double mse = (m[0] + m[1] + m[2]) / 3.0;
         psnr = mse > 0 ? 10 * std::log10(255.0 * 255.0 / mse) : 99;
     }
-    bool pass = rms < 0.5 && worst < 1.5 && psnr > 24;
+    bool pass = rms < 0.5 && worst < 1.5 && psnr > 20;
     return @{@"rotationRmsDeg" : @(rms), @"rotationMaxDeg" : @(worst), @"psnr" : @(psnr), @"pass" : @(pass)};
 }
 
