@@ -48,6 +48,7 @@ jobs:
               if ph:
                   print(ph[0]["name"], file=sys.stderr); print(ph[0]["udid"]); break
           ')
+          echo "DEV=$DEV" >> "$GITHUB_ENV"
           xcrun simctl boot "$DEV"
           xcrun simctl bootstatus "$DEV" -b > /dev/null
           APP=$(find build/sim/Build/Products -name "PhotoSphere.app" -maxdepth 2 | head -1)
@@ -68,6 +69,36 @@ jobs:
           cp "$CONT/Documents/Panoramas/"selftest-*.jpg shots/ || true
           cp "$CONT/tmp/selftest/room/truth.jpg" shots/truth-room.jpg || true
           grep -q "ALL PASS" shots/selftest.txt
+      - name: real photos (the owner's room, from a private link)
+        if: always()
+        env:
+          ROOM_URLS: ${{ secrets.ROOM_URLS }}
+        run: |
+          if [ -z "$ROOM_URLS" ] || [ -z "$DEV" ]; then echo "no photos or no simulator"; exit 0; fi
+          mkdir -p room private
+          i=0
+          while read -r u; do
+            [ -z "$u" ] && continue
+            i=$((i + 1))
+            curl -sL -A "Mozilla/5.0" -o "room/$(printf %02d "$i").jpg" "$u"
+          done <<< "$ROOM_URLS"
+          echo "$(ls room | wc -l) photos"
+          CONT=$(xcrun simctl get_app_container "$DEV" "$BUNDLE" data)
+          mkdir -p "$CONT/tmp/room"
+          cp room/*.jpg "$CONT/tmp/room/"
+          xcrun simctl terminate "$DEV" "$BUNDLE" 2>/dev/null || true
+          xcrun simctl launch "$DEV" "$BUNDLE" -stitchdir room -focalPx 1344 -out room -width 4096
+          for k in $(seq 1 240); do [ -f "$CONT/Documents/room.txt" ] && break; sleep 5; done
+          if [ ! -f "$CONT/Documents/room.txt" ]; then echo "no result in time"; xcrun simctl io "$DEV" screenshot private/room-timeout.png; exit 0; fi
+          cat "$CONT/Documents/room.txt" | tee private/room.txt; echo
+          sleep 6; xcrun simctl io "$DEV" screenshot private/room-viewer.png
+          cp "$CONT/Documents/Panoramas/room.jpg" private/ || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: room-test
+          path: private
+          if-no-files-found: ignore
       - name: iPhone build (unsigned) and ipa
         if: always()
         run: |

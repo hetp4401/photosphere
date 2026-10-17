@@ -15,6 +15,7 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic) BOOL fullCircle;
 @property (nonatomic) int imagesUsed;
 @property (nonatomic) int pairsMatched;
+@property (nonatomic) int pairsDirect;
 @property (nonatomic) double focalPx;
 @property (nonatomic) double seconds;
 @property (nonatomic, copy) NSArray<NSArray<NSNumber *> *> *rotations;
@@ -37,6 +38,12 @@ typedef void (^PanoProgress)(double fraction, NSString *stage);
                                  outputPath:(NSString *)outputPath
                                    progress:(nullable PanoProgress)progress
                                       error:(NSError *_Nullable *_Nullable)error;
+
+/// For photos without sensor orientations (a camera app's): every pair is matched, the relative rotations are chained
+/// over a spanning tree from the best-connected photo, "up" is the direction all the photos' right vectors are
+/// perpendicular to (the phone held upright), and the result is a set of orientations the normal stitch can start
+/// from. Returns {"placed": [indices of the photos that could be placed], "rotations": [[9]] for those}.
++ (nullable NSDictionary *)bootstrapRotations:(NSArray<NSString *> *)paths focalPx:(double)focalPx progress:(nullable PanoProgress)progress;
 
 /// Makes a synthetic textured panorama and renders a photo of it at each (yaw, pitch) given, with realistic noise:
 /// exposure changes, sensor noise, JPEG, and sensor rotations perturbed by random error plus a slow yaw drift. Returns

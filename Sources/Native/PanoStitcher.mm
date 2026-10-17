@@ -149,7 +149,8 @@ bool refineDirect(const Small &a, const Small &b, Matx33d &Rji, double &before, 
         pts.resize(3000);
     }
     Matx33d R0 = Rji;
-    double alpha = 1, beta = 0;
+    double alpha = 1, beta = 0, lastStep = 1;
+    bool conditioned = false;
     before = after = 0;
     points = 0;
     for (int it = 0; it < 25; it++) {
@@ -191,6 +192,9 @@ bool refineDirect(const Small &a, const Small &b, Matx33d &Rji, double &before, 
         if (it == 0) before = sumAbs / used;
         after = sumAbs / used;
         points = used;
+        Mat ev;
+        cv::eigen(A(cv::Rect(0, 0, 3, 3)), ev);  // (the rotation's conditioning: a plain overlap constrains it poorly)
+        conditioned = ev.at<double>(2) > 1e-4 * ev.at<double>(0);
         for (int r = 0; r < 5; r++) A.at<double>(r, r) += 1e-6;
         Mat x;
         if (!cv::solve(A, rhs, x, cv::DECOMP_CHOLESKY)) return false;
@@ -198,15 +202,16 @@ bool refineDirect(const Small &a, const Small &b, Matx33d &Rji, double &before, 
         Rji = expSO3(w) * Rji;
         alpha += x.at<double>(3);
         beta += x.at<double>(4);
-        if (cv::norm(w) < 1e-5) break;
+        lastStep = cv::norm(w);
+        if (lastStep < 1e-5) break;
     }
-    return after < 0.8 * before && angleOf(Rji * R0.t()) < rad(6);
+    return conditioned && lastStep < 1e-3 && after <= before && angleOf(Rji * R0.t()) < rad(6);
 }
 
 struct View {
     int w = 0, h = 0;                // at match scale
     double scale = 1;                // match pixels per photo pixel
-    Small s8, s4;                    // for the direct alignment: 1/8 and 1/4 of match scale
+    Small s16, s8, s4;               // for the direct alignment: 1/16, 1/8 and 1/4 of match scale
     std::vector<cv::KeyPoint> kps;
     Mat desc;
     std::vector<Vec3d> rays;         // camera-frame unit rays of the keypoints
@@ -668,6 +673,7 @@ NSArray<NSNumber *> *arrayFrom(const Matx33d &R) {
         cxm = (v.w - 1) / 2.0;
         cym = (v.h - 1) / 2.0;
         orb->detectAndCompute(gray, cv::noArray(), v.kps, v.desc);
+        v.s16 = makeSmall(gray, fm, 0.0625);
         v.s8 = makeSmall(gray, fm, 0.125);
         v.s4 = makeSmall(gray, fm, 0.25);
         v.rays.resize(v.kps.size());
@@ -810,6 +816,7 @@ NSArray<NSNumber *> *arrayFrom(const Matx33d &R) {
                 Matx33d Rji = R[j].t() * R[i];
                 double before = 0, after = 0;
                 int pts = 0;
+                if (!refineDirect(a.s16, b.s16, Rji, before, after, pts)) continue;
                 if (!refineDirect(a.s8, b.s8, Rji, before, after, pts)) continue;
                 if (!refineDirect(a.s4, b.s4, Rji, before, after, pts)) continue;
                 PairMatch pm;
@@ -980,7 +987,8 @@ NSArray<NSNumber *> *arrayFrom(const Matx33d &R) {
     res.cropTop = top;
     res.fullCircle = full;
     res.imagesUsed = n;
-    res.pairsMatched = imagePairs + directPairs;
+    res.pairsMatched = imagePairs;
+    res.pairsDirect = directPairs;
     res.focalPx = fFull;
     res.seconds = ((double)cv::getTickCount() - t0) / cv::getTickFrequency();
     NSMutableArray *rots = [NSMutableArray array];
@@ -993,6 +1001,120 @@ NSArray<NSNumber *> *arrayFrom(const Matx33d &R) {
         if (error) *error = err([NSString stringWithFormat:@"stitching failed: %s", e.what()]);
         return nil;
     }
+}
+
+// ---------------------------------------------------------------- orientations from the photos alone
+
++ (nullable NSDictionary *)bootstrapRotations:(NSArray<NSString *> *)paths focalPx:(double)focalPx progress:(nullable PanoProgress)progress {
+    auto report = [&](double frac, NSString *stage) {
+        if (progress) progress(frac, stage);
+    };
+    int n = (int)paths.count;
+    if (n < 2) return nil;
+    std::mt19937 rng(5);
+    cv::Ptr<cv::ORB> orb = cv::ORB::create(4000, 1.2f, 8, 31, 0, 2, cv::ORB::HARRIS_SCORE, 31, 10);
+    struct F {
+        std::vector<cv::KeyPoint> kps;
+        Mat desc;
+        std::vector<Vec3d> rays;
+    };
+    std::vector<F> fs(n);
+    double fm = focalPx, cx = 0, cy = 0;
+    for (int i = 0; i < n; i++) {
+        Mat img = cv::imread(paths[i].UTF8String, cv::IMREAD_GRAYSCALE);
+        if (img.empty()) return nil;
+        double scale = std::min(1.0, (double)kMatchWidth / std::max(img.cols, img.rows));
+        if (i == 0) fm = focalPx * scale;
+        Mat gray;
+        cv::resize(img, gray, cv::Size(), scale, scale, cv::INTER_AREA);
+        cx = (gray.cols - 1) / 2.0;
+        cy = (gray.rows - 1) / 2.0;
+        orb->detectAndCompute(gray, cv::noArray(), fs[i].kps, fs[i].desc);
+        for (auto &k : fs[i].kps) fs[i].rays.push_back(rayOf(k.pt.x, k.pt.y, fm, cx, cy));
+        report(0.4 * (i + 1) / n, @"finding features");
+    }
+    struct Edge {
+        int i, j, inliers;
+        Matx33d Rji;
+    };
+    std::vector<Edge> edges;
+    cv::BFMatcher matcher(cv::NORM_HAMMING);
+    int total = n * (n - 1) / 2, seen = 0;
+    for (int i = 0; i < n; i++) {
+        for (int j = i + 1; j < n; j++) {
+            report(0.4 + 0.55 * (++seen) / total, @"matching every pair");
+            if (fs[i].desc.empty() || fs[j].desc.empty()) continue;
+            std::vector<std::vector<cv::DMatch>> knn;
+            matcher.knnMatch(fs[i].desc, fs[j].desc, knn, 2);
+            std::vector<Vec3d> ra, rb;
+            for (auto &m : knn) {
+                if (m.size() < 2 || m[0].distance > kRatio * m[1].distance) continue;
+                ra.push_back(fs[i].rays[m[0].queryIdx]);
+                rb.push_back(fs[j].rays[m[0].trainIdx]);
+            }
+            if (ra.size() < 15) continue;
+            Matx33d Rji;
+            std::vector<int> inl;
+            if (!ransacRotation(ra, rb, rng, Rji, inl)) continue;
+            if ((int)inl.size() < 12 || (int)inl.size() <= 5 + 0.15 * (int)ra.size()) continue;
+            edges.push_back({i, j, (int)inl.size(), Rji});
+        }
+    }
+    if (edges.empty()) return nil;
+    // the spanning tree of most inliers, from the photo with the most of them
+    std::vector<int> degree(n, 0);
+    for (auto &e : edges) {
+        degree[e.i] += e.inliers;
+        degree[e.j] += e.inliers;
+    }
+    int root = (int)(std::max_element(degree.begin(), degree.end()) - degree.begin());
+    std::vector<Matx33d> R(n, Matx33d::eye());
+    std::vector<bool> placed(n, false);
+    placed[root] = true;
+    for (int placedCount = 1; placedCount < n;) {
+        const Edge *best = nullptr;
+        bool fromI = false;
+        for (auto &e : edges) {
+            if (placed[e.i] == placed[e.j]) continue;
+            if (!best || e.inliers > best->inliers) {
+                best = &e;
+                fromI = placed[e.i];
+            }
+        }
+        if (!best) break;
+        if (fromI) R[best->j] = R[best->i] * best->Rji.t();  // (Rji = Rj^T Ri)
+        else R[best->i] = R[best->j] * best->Rji;
+        placed[fromI ? best->j : best->i] = true;
+        placedCount++;
+    }
+    // "up": perpendicular to every placed photo's right vector; the world's y points down, z along the root's forward
+    Mat Mx = Mat::zeros(3, 3, CV_64F);
+    for (int i = 0; i < n; i++) {
+        if (!placed[i]) continue;
+        Vec3d x(R[i](0, 0), R[i](1, 0), R[i](2, 0));
+        for (int r = 0; r < 3; r++)
+            for (int c = 0; c < 3; c++) Mx.at<double>(r, c) += x[r] * x[c];
+    }
+    Mat evals, evecs;
+    cv::eigen(Mx, evals, evecs);
+    Vec3d up(evecs.at<double>(2, 0), evecs.at<double>(2, 1), evecs.at<double>(2, 2));
+    double sign = 0;
+    for (int i = 0; i < n; i++)
+        if (placed[i]) sign += up.dot(Vec3d(-R[i](0, 1), -R[i](1, 1), -R[i](2, 1)));  // (the cameras' own up: -y)
+    if (sign < 0) up = -up;
+    Vec3d ey = -up, f0 = forwardOf(R[root]);
+    Vec3d ez = unit(f0 - ey * f0.dot(ey));
+    if (cv::norm(ez) < 1e-6) ez = unit(Vec3d(R[root](0, 1), R[root](1, 1), R[root](2, 1)).cross(ey));
+    Vec3d ex = ey.cross(ez);
+    Matx33d G(ex[0], ex[1], ex[2], ey[0], ey[1], ey[2], ez[0], ez[1], ez[2]);
+    NSMutableArray *idx = [NSMutableArray array], *rots = [NSMutableArray array];
+    for (int i = 0; i < n; i++) {
+        if (!placed[i]) continue;
+        [idx addObject:@(i)];
+        [rots addObject:arrayFrom(G * R[i])];
+    }
+    report(1.0, @"placed");
+    return @{@"placed" : idx, @"rotations" : rots, @"edges" : @((int)edges.size()), @"root" : @(root)};
 }
 
 // ---------------------------------------------------------------- the self test

@@ -8,6 +8,8 @@ struct PhotoSphereApp: App {
         WindowGroup {
             if CommandLine.arguments.contains("-selftest") {
                 SelfTestView()
+            } else if CommandLine.arguments.contains("-stitchdir") {
+                StitchDirView()
             } else {
                 RootView()
             }
