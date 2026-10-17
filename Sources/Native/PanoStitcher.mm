@@ -57,10 +57,12 @@ NSError *err(const std::string &msg) {
                                 outputWidth:(int)outputWidth
                                  outputPath:(NSString *)outputPath
                           priorsFromSensors:(BOOL)priorsFromSensors
+                              nadirPatchDeg:(double)nadirPatchDeg
                                    progress:(nullable PanoProgress)progress
                                       error:(NSError **)error {
     try {
-        pano::StitchResult r = pano::stitch(strings(paths), matricesFrom(rotations), focalPx, outputWidth, outputPath.UTF8String, progressFrom(progress), priorsFromSensors);
+        pano::StitchResult r = pano::stitch(strings(paths), matricesFrom(rotations), focalPx, outputWidth, outputPath.UTF8String, progressFrom(progress), priorsFromSensors,
+                                            nadirPatchDeg);
         PanoStitchResult *res = [PanoStitchResult new];
         res.path = [NSString stringWithUTF8String:r.path.c_str()];
         res.fullWidth = r.fullW;

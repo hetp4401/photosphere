@@ -916,8 +916,11 @@ inline void fillHoles(Mat &result, const Mat &coverage) {
 
 /// sensors: the rotations come from a gyro (the app's captures). false: they were worked out from the images (bootstrap),
 /// so they get no sensor pairs or geometry checks, a weaker gravity prior, and a photo nothing holds is dropped.
+/// nadirPatchDeg: when > 0 and the sphere is complete, that many degrees of the ground right under the camera (the
+/// photographer's own feet) are painted over from the floor around them.
 inline StitchResult stitch(const std::vector<std::string> &paths, const std::vector<Matx33d> &rotations, double focalPx,
-                           int outputWidth, const std::string &outputPath, const Progress &progress, bool sensors = true) {
+                           int outputWidth, const std::string &outputPath, const Progress &progress, bool sensors = true,
+                           double nadirPatchDeg = 0) {
     auto report = [&](double frac, const char *stage) {
         if (progress) progress(frac, stage);
     };
@@ -931,6 +934,9 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
     std::vector<Mat> photos(n);
     cv::Ptr<cv::ORB> orb = cv::ORB::create(4000, 1.2f, 8, 31, 0, 2, cv::ORB::HARRIS_SCORE, 31, 10);  // (a low FAST threshold: plain walls)
     double matchScale = 1, fm = focalPx;
+    // (the photos are kept no larger than the render needs: 1.3x the output's resolution; a phone's memory is finite)
+    Equirect eq(outputWidth);
+    double composeScale = std::min(1.0, 1.3 * (eq.W / (2 * kPi)) / focalPx);
     for (int i = 0; i < n; i++) {
         Mat img = cv::imread(paths[i], cv::IMREAD_COLOR);
         if (img.empty()) throw std::runtime_error("can't read " + paths[i]);
@@ -938,7 +944,8 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
             matchScale = std::min(1.0, (double)kMatchWidth / std::max(img.cols, img.rows));
             fm = focalPx * matchScale;
         }
-        photos[i] = img;
+        if (composeScale < 0.999) cv::resize(img, photos[i], cv::Size(), composeScale, composeScale, cv::INTER_AREA);
+        else photos[i] = img;
         View &v = views[i];
         // (every photo's long side goes to the match width: one camera, so one match-scale focal, whichever way it was held)
         v.scale = std::min(1.0, (double)kMatchWidth / std::max(img.cols, img.rows));
@@ -997,7 +1004,7 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
             Matx33d Rvis;                 // camera j from camera i, from the images
             std::vector<int> inl;
             if (!ransacRotation(ra, rb, rng, Rvis, inl)) continue;
-            if ((int)inl.size() <= 5 + 0.15 * (int)ra.size()) continue;  // (INLIER_FAIL)
+            if ((int)inl.size() < 10 || (int)inl.size() <= 5 + 0.15 * (int)ra.size()) continue;  // (INLIER_FAIL; and under 10 a chance)
             if (!sensors && ((int)inl.size() < 12 || angleOf(Rvis * (b.Rp.t() * a.Rp).t()) > rad(kPriorAgreeDeg))) continue;  // (a chance match)
             if (sensors) {
                 Matx33d Rsens = b.Rp.t() * a.Rp, E = Rvis * Rsens.t();
@@ -1196,8 +1203,6 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
     }
 
     // ---- render: each photo warped onto the canvas, exposure matched, seams cut, blended in bands
-    Equirect eq(outputWidth);
-    double composeScale = std::min(1.0, 1.3 * (eq.W / (2 * kPi)) / fFull);  // (sources no more than 1.3x the output's resolution)
     std::vector<Piece> pieces;
     Mat coverage = Mat::zeros(eq.H, eq.W, CV_8U);
     report(0.6, "matching exposure");
@@ -1214,7 +1219,6 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
             continue;
         }
         Mat src = photos[i];
-        if (composeScale < 0.999) cv::resize(photos[i], src, cv::Size(), composeScale, composeScale, cv::INTER_AREA);
         applyGain(src, gammas[i]);
         double f = fAdj / views[i].scale * composeScale, cx = (src.cols - 1) / 2.0, cy = (src.rows - 1) / 2.0;
         size_t before = pieces.size();
@@ -1286,6 +1290,26 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
     result16(cv::Rect(pad, 0, eq.W, eq.H)).convertTo(result, CV_8U);
     result.setTo(cv::Scalar(0, 0, 0), coverage == 0);
     fillHoles(result, coverage);  // (small holes filled from their surroundings, large ones black, as GCam)
+    if (nadirPatchDeg > 0 && cv::countNonZero(coverage.row(eq.H - 1)) == eq.W) {
+        // the ground right under the camera: the photographer's feet, painted over from the floor around them (a nadir
+        // patch, as 360 tools do; GCam left the feet in), with a soft upper edge
+        int rows = std::min(eq.H / 2, (int)std::lround(eq.H * nadirPatchDeg / 180.0));
+        if (rows > 4) {
+            Mat band = Mat::zeros(eq.H, eq.W, CV_8U);
+            band(cv::Rect(0, eq.H - rows, eq.W, rows)).setTo(255);
+            Mat small, smallMask, filled, up;
+            cv::resize(result, small, cv::Size(), 0.25, 0.25, cv::INTER_AREA);
+            cv::resize(band, smallMask, small.size(), 0, 0, cv::INTER_NEAREST);
+            cv::inpaint(small, smallMask, filled, 5, 1 /* INPAINT_TELEA */);
+            cv::GaussianBlur(filled, filled, cv::Size(0, 0), 2);
+            cv::resize(filled, up, result.size(), 0, 0, cv::INTER_LINEAR);
+            int soft = std::max(2, rows / 6);
+            for (int y = eq.H - rows; y < eq.H; y++) {
+                double a = std::min(1.0, (y - (eq.H - rows) + 1.0) / soft);
+                cv::addWeighted(up.row(y), a, result.row(y), 1 - a, 0, result.row(y));
+            }
+        }
+    }
 
     // ---- crop: a full circle keeps its width and loses rows not fully covered (10 deg at most each end); a partial
     // sphere is cut to what's covered

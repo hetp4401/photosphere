@@ -35,12 +35,14 @@ typedef void (^PanoProgress)(double fraction, NSString *stage);
 /// length in pixels of those photos. outputWidth: the width of the full 360x180 canvas (its height is half).
 /// priorsFromSensors: YES when the rotations came from the gyro (the app's captures), NO when they were worked out from
 /// the images (bootstrapRotations): then there are no sensor ties, and a photo nothing holds is dropped.
+/// nadirPatchDeg: > 0 paints over that many degrees of ground right under the camera (the photographer's feet).
 + (nullable PanoStitchResult *)stitchImages:(NSArray<NSString *> *)paths
                                   rotations:(NSArray<NSArray<NSNumber *> *> *)rotations
                                     focalPx:(double)focalPx
                                 outputWidth:(int)outputWidth
                                  outputPath:(NSString *)outputPath
                           priorsFromSensors:(BOOL)priorsFromSensors
+                              nadirPatchDeg:(double)nadirPatchDeg
                                    progress:(nullable PanoProgress)progress
                                       error:(NSError *_Nullable *_Nullable)error;
 

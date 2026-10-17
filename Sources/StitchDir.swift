@@ -52,7 +52,7 @@ final class StitchDirModel: ObservableObject {
                 lines.append("bootstrap: placed \(placed.count) of \(paths.count), \(boot["edges"] ?? 0) matched pairs (\(boot["rejected"] ?? 0) rejected), root photo \(boot["root"] ?? -1), \(Int(Date().timeIntervalSince(t0))) s")
                 let used = placed.map { paths[$0.intValue] }
                 let raw = dir.appendingPathComponent("result.jpg").path
-                let res = try PanoStitcher.stitchImages(used, rotations: rots, focalPx: focal, outputWidth: Int32(width), outputPath: raw, priorsFromSensors: false, progress: show)
+                let res = try PanoStitcher.stitchImages(used, rotations: rots, focalPx: focal, outputWidth: Int32(width), outputPath: raw, priorsFromSensors: false, nadirPatchDeg: 0, progress: show)
                 let packet = XMP.gpanoPacket(fullWidth: Int(res.fullWidth), fullHeight: Int(res.fullHeight), cropWidth: Int(res.cropWidth), cropHeight: Int(res.cropHeight),
                                              left: Int(res.cropLeft), top: Int(res.cropTop), headingDeg: 0, firstDate: Date(), lastDate: Date(), sourceCount: used.count, usePanoramaViewer: true)
                 let data = XMP.embed(packet: packet, in: try Data(contentsOf: URL(fileURLWithPath: raw)))

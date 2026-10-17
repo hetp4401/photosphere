@@ -36,11 +36,15 @@ final class SphereOverlay {
         scene.rootNode.addChildNode(dotsNode)
     }
 
-    /// The photo's fields of view as held, in degrees: the overlay's camera matches the live preview's.
+    /// The photo's fields of view as held, in degrees (the pasted photos are sized by them).
     func setFov(hfovDeg: Double, vfovDeg: Double) {
         hfov = hfovDeg
         vfov = vfovDeg
-        cameraNode.camera?.fieldOfView = CGFloat(hfovDeg)
+    }
+
+    /// The part of the lens's width the screen shows, in degrees: the overlay's camera.
+    func setVisibleHfov(_ deg: Double) {
+        cameraNode.camera?.fieldOfView = CGFloat(deg)
     }
 
     func setCamera(_ R: Mat3) {

@@ -66,9 +66,20 @@ final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelega
         }
     }
 
+    /// The preview fills the screen, so only the middle of the lens's width is on it: the overlay's camera gets exactly
+    /// that, or the dots would slide against the scene as the phone turns.
+    private func updateVisibleFov() {
+        guard view.bounds.height > 0 else { return }
+        let screenAspect = Double(view.bounds.width / view.bounds.height)
+        let feedAspect = tan(hfov / 2) / tan(vfov / 2)  // (the photo's, as held)
+        let frac = min(1.0, screenAspect / feedAspect)
+        overlay.setVisibleHfov(2 * atan(frac * tan(hfov / 2)) * 180 / .pi)
+    }
+
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
         previewLayer?.frame = view.bounds
+        updateVisibleFov()
     }
 
     private func buildUI() {
@@ -145,7 +156,7 @@ final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelega
             }
             self.captureSession.addInput(input)
             if self.captureSession.canAddOutput(self.photoOutput) { self.captureSession.addOutput(self.photoOutput) }
-            self.photoOutput.maxPhotoQualityPrioritization = .speed  // (no Deep Fusion: each photo processed alike)
+            self.photoOutput.maxPhotoQualityPrioritization = .balanced  // (the camera's own processing, as the Camera app)
             self.captureSession.commitConfiguration()
             self.device = dev
             // the lens's field of view: AVFoundation gives the sensor's horizontal one (its long side); as held in
@@ -157,6 +168,7 @@ final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelega
                 self.hfov = shortFov
                 self.vfov = longFov
                 self.overlay.setFov(hfovDeg: shortFov * 180 / .pi, vfovDeg: longFov * 180 / .pi)
+                self.updateVisibleFov()
                 self.session.setCamera(width: 0, height: 0, focalPx: 0, hfovDeg: shortFov * 180 / .pi, vfovDeg: longFov * 180 / .pi)
                 if let c = self.previewLayer?.connection { Self.portrait(c) }
             }
@@ -285,7 +297,7 @@ final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelega
         if let t = targets { counterLabel.text = "\(t.capturedCount) of \(t.total)" }
         hintLabel.text = "Hold still…"
         let settings = AVCapturePhotoSettings(format: [AVVideoCodecKey: AVVideoCodecType.jpeg])
-        settings.photoQualityPrioritization = .speed
+        settings.photoQualityPrioritization = .balanced
         if let c = photoOutput.connection(with: .video) { Self.portrait(c) }
         photoOutput.capturePhoto(with: settings, delegate: self)
         AudioServicesPlaySystemSound(1108)

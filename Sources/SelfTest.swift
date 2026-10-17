@@ -60,7 +60,7 @@ final class SelfTestModel: ObservableObject {
                 }
                 do {
                     let raw = (wdir as NSString).appendingPathComponent("result.jpg")
-                    let res = try PanoStitcher.stitchImages(paths, rotations: priors, focalPx: focal, outputWidth: 4096, outputPath: raw, priorsFromSensors: true) { f, s in
+                    let res = try PanoStitcher.stitchImages(paths, rotations: priors, focalPx: focal, outputWidth: 4096, outputPath: raw, priorsFromSensors: true, nadirPatchDeg: 0) { f, s in
                         Task { @MainActor in self.status = String(format: "%@: %@ %.0f%%", world, s, f * 100) }
                     }
                     let metrics = PanoStitcher.selfTestMetrics(for: res, truthPano: truthPano, truthRotations: truth)
