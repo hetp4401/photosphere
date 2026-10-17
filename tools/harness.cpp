@@ -72,6 +72,17 @@ int main(int argc, char **argv) {
             pano::Synth s = pano::generate(dir, yaws, pitches, fov, 1600, 1200, panoW, world);
             pano::StitchResult r = pano::stitch(s.images, s.priors, s.focalPx, panoW, dir + "/result.jpg", show);
             pano::Metrics m = pano::metrics(r, s.pano, s.truth);
+            {  // the worst-placed photos, with where they look
+                std::vector<int> idx(m.perPhotoDeg.size());
+                for (size_t k = 0; k < idx.size(); k++) idx[k] = (int)k;
+                std::sort(idx.begin(), idx.end(), [&](int a, int b) { return m.perPhotoDeg[a] > m.perPhotoDeg[b]; });
+                printf("worst photos:");
+                for (size_t k = 0; k < idx.size() && k < 8; k++)
+                    printf(" #%d %.2f deg (yaw %.0f pitch %.0f)", idx[k], m.perPhotoDeg[idx[k]], yaws[idx[k]] * 180 / M_PI, pitches[idx[k]] * 180 / M_PI);
+                printf("\n");
+                std::ofstream pr(dir + "/pairs.txt");
+                pr << r.pairReport;
+            }
             printf("SELFTEST %s photos=%d featurePairs=%d directPairs=%d rotRMS=%.3f deg rotMax=%.3f deg psnr=%.2f dB crop=%dx%d of %dx%d full=%d seconds=%.1f notes=[%s] %s\n",
                    world.c_str(), r.images, r.featurePairs, r.directPairs, m.rotationRmsDeg, m.rotationMaxDeg, m.psnr, r.cropW, r.cropH, r.fullW, r.fullH,
                    r.full ? 1 : 0, r.seconds, r.notes.c_str(), m.pass ? "PASS" : "FAIL");
@@ -85,12 +96,19 @@ int main(int argc, char **argv) {
             auto t0 = std::chrono::steady_clock::now();
             pano::Bootstrap b = pano::bootstrap(paths, focal, show);
             double bs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-            printf("bootstrap: placed %zu of %zu, %d matched pairs, root %d, %.0f s\n", b.placed.size(), paths.size(), b.edges, b.root, bs);
+            printf("bootstrap: placed %zu of %zu, %d matched pairs (%d rejected), root %d, %.0f s; not placed:", b.placed.size(), paths.size(), b.edges, b.rejected, b.root, bs);
+            for (size_t i = 0; i < paths.size(); i++)
+                if (std::find(b.placed.begin(), b.placed.end(), (int)i) == b.placed.end()) printf(" %s", paths[i].substr(paths[i].rfind('/') + 1).c_str());
+            printf("\n");
             std::vector<std::string> used;
             for (int i : b.placed) used.push_back(paths[i]);
-            pano::StitchResult r = pano::stitch(used, b.R, focal, width, out, show);
-            printf("stitch: %d photos, %d feature pairs, %d direct pairs, focal %.0f px, crop %dx%d of %dx%d, full circle %d, %.1f s, notes=[%s]\n",
+            pano::StitchResult r = pano::stitch(used, b.R, focal, width, out, show, false);
+            printf("stitch: %d photos, %d feature pairs, %d direct pairs, focal %.0f px, crop %dx%d of %dx%d, full circle %d, %.1f s, notes=[%s]; dropped:",
                    r.images, r.featurePairs, r.directPairs, r.focal, r.cropW, r.cropH, r.fullW, r.fullH, r.full ? 1 : 0, r.seconds, r.notes.c_str());
+            for (int i : r.dropped) printf(" %s", used[i].substr(used[i].rfind('/') + 1).c_str());
+            printf("\n");
+            std::ofstream pr(out + ".pairs.txt");
+            pr << r.pairReport;
             std::ofstream rot(out + ".rotations.txt");
             for (size_t k = 0; k < r.R.size(); k++) {
                 rot << used[k];

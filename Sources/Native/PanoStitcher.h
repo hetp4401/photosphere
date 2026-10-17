@@ -20,6 +20,7 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic) double seconds;
 @property (nonatomic, copy) NSArray<NSArray<NSNumber *> *> *rotations;
 @property (nonatomic, copy) NSString *notes;
+@property (nonatomic, copy) NSArray<NSNumber *> *dropped;  // indices of photos not rendered (nothing held them; image-only priors)
 @end
 
 typedef void (^PanoProgress)(double fraction, NSString *stage);
@@ -32,11 +33,14 @@ typedef void (^PanoProgress)(double fraction, NSString *stage);
 /// paths: the photos (upright, all the same size). rotations: each photo's world-from-camera matrix from the sensors
 /// (camera frame: x right, y down, z forward; world: y down, z the first photo's forward). focalPx: the lens's focal
 /// length in pixels of those photos. outputWidth: the width of the full 360x180 canvas (its height is half).
+/// priorsFromSensors: YES when the rotations came from the gyro (the app's captures), NO when they were worked out from
+/// the images (bootstrapRotations): then there are no sensor ties, and a photo nothing holds is dropped.
 + (nullable PanoStitchResult *)stitchImages:(NSArray<NSString *> *)paths
                                   rotations:(NSArray<NSArray<NSNumber *> *> *)rotations
                                     focalPx:(double)focalPx
                                 outputWidth:(int)outputWidth
                                  outputPath:(NSString *)outputPath
+                          priorsFromSensors:(BOOL)priorsFromSensors
                                    progress:(nullable PanoProgress)progress
                                       error:(NSError *_Nullable *_Nullable)error;
 

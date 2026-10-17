@@ -24,7 +24,7 @@ final class StitchJob: ObservableObject {
                 let longFov = max(info.hfovDeg, info.vfovDeg) * .pi / 180
                 let focalPx = info.focalPx > 0 ? info.focalPx : (longSide / 2) / tan(longFov / 2)
                 let raw = FileManager.default.temporaryDirectory.appendingPathComponent("pano_raw.jpg")
-                let res = try PanoStitcher.stitchImages(paths, rotations: rotations, focalPx: focalPx, outputWidth: Int32(outputWidth), outputPath: raw.path) { f, s in
+                let res = try PanoStitcher.stitchImages(paths, rotations: rotations, focalPx: focalPx, outputWidth: Int32(outputWidth), outputPath: raw.path, priorsFromSensors: true) { f, s in
                     Task { @MainActor in
                         self.fraction = f
                         self.stage = s

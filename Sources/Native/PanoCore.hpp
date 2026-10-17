@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cmath>
 #include <functional>
+#include <map>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -29,13 +30,15 @@ struct StitchResult {
     int images = 0, featurePairs = 0, directPairs = 0;
     double focal = 0, seconds = 0;
     std::vector<Matx33d> R;
+    std::vector<int> dropped;        // photos not rendered: nothing held them (photos without a gyro only)
     std::string notes;
+    std::string pairReport;          // one line per pair after the adjustment: i j kind inliers median_px
 };
 
 struct Bootstrap {
     std::vector<int> placed;
     std::vector<Matx33d> R;
-    int edges = 0, root = -1;
+    int edges = 0, rejected = 0, root = -1;
 };
 
 struct Synth {
@@ -49,6 +52,7 @@ struct Synth {
 struct Metrics {
     double rotationRmsDeg = 99, rotationMaxDeg = 99, psnr = 0;
     bool pass = false;
+    std::vector<double> perPhotoDeg;
 };
 
 inline void makeDirs(const std::string &dir) {
@@ -71,6 +75,9 @@ constexpr int kKeepMatches = 35;         // inliers kept per pair for the global
 constexpr double kRatio = 0.8;           // Lowe's ratio (GCam: 0.64 on squared distances)
 constexpr double kAxesNear = 0.9;        // two photos are candidates when their axes are within this times the FOV
 constexpr double kLatGateDeg = 9.0;
+constexpr double kCycleDeg = 4.0;        // without a gyro, a pair is believed when a third photo closes the triangle within this
+constexpr int kStrongEdge = 40;          // ...or when it has this many inliers on its own
+constexpr double kSupportPx = 25.0;      // ...and a photo stays when one of its matches holds within this after the adjustment
 constexpr double kGammaMax = 2.5;        // a photo's gamma at most (GCam: 1.75; an iPhone's auto exposure spans more)      // and a match's two rays must lie within this latitude band (GCam: 6 deg bins +-1)
 
 double deg(double r) { return r * 180.0 / kPi; }
@@ -296,12 +303,12 @@ inline double distToLine(const Point2d &p, const Point2d &a, const Point2d &b) {
 
 /// Segments of photo i matched to segments of photo j under the current rotations: the endpoints transferred, the
 /// nearest segment of about the same direction that they lie close to and overlap, mutual best (GCam: LineFeatureMatcher).
-inline void matchLines(int i, int j, const std::vector<LineSeg> &li, const std::vector<LineSeg> &lj, const Matx33d &Rji, double f, double cx, double cy,
-                       int wj, int hj, std::vector<LineMatch> &out, int cap = 60) {
+inline void matchLines(int i, int j, const std::vector<LineSeg> &li, const std::vector<LineSeg> &lj, const Matx33d &Rji, double f, double cxi, double cyi,
+                       double cxj, double cyj, int wj, int hj, std::vector<LineMatch> &out, int cap = 60) {
     auto transfer = [&](const Point2d &p, Point2d &q) {
-        Vec3d d = Rji * Vec3d((p.x - cx) / f, (p.y - cy) / f, 1);
+        Vec3d d = Rji * Vec3d((p.x - cxi) / f, (p.y - cyi) / f, 1);
         if (d[2] <= 0.1) return false;
-        q = Point2d(f * d[0] / d[2] + cx, f * d[1] / d[2] + cy);
+        q = Point2d(f * d[0] / d[2] + cxj, f * d[1] / d[2] + cyj);
         return q.x > -0.2 * wj && q.y > -0.2 * hj && q.x < 1.2 * wj && q.y < 1.2 * hj;
     };
     std::vector<int> bestFor(li.size(), -1), bestBack(lj.size(), -1);
@@ -354,6 +361,7 @@ inline void matchLines(int i, int j, const std::vector<LineSeg> &li, const std::
 struct View {
     int w = 0, h = 0;                // at match scale
     double scale = 1;                // match pixels per photo pixel
+    double cx = 0, cy = 0;           // its centre at match scale (a landscape photo among portraits has its own)
     Small s16, s8, s4;               // for the direct alignment: 1/16, 1/8 and 1/4 of match scale
     std::vector<LineSeg> lines;      // its straight edges
     std::vector<cv::KeyPoint> kps;
@@ -430,7 +438,8 @@ struct BAProblem {
     std::vector<Matx33d> R0;         // the priors
     std::vector<PairMatch> *pairs = nullptr;
     std::vector<LineMatch> *lines = nullptr;
-    double f0 = 1, cx = 0, cy = 0;   // match-scale intrinsics
+    double f0 = 1;                   // the match-scale focal
+    std::vector<double> cxs, cys;    // each photo's centre at match scale
     double ws = 0;                   // the gravity priors' weight (GCam: 0.0125 * matches / images)
     std::vector<double> pitch0, roll0;
 };
@@ -448,34 +457,51 @@ void baResiduals(const BAProblem &P, const std::vector<double> &x, std::vector<d
     for (auto &pm : *P.pairs) {
         Matx33d Rji = R[pm.j].t() * R[pm.i];  // camera j from camera i
         for (size_t k = 0; k < pm.pi.size(); k++) {
-            Vec3d d = Rji * Vec3d((pm.pi[k].x - P.cx) / f, (pm.pi[k].y - P.cy) / f, 1);
+            Vec3d d = Rji * Vec3d((pm.pi[k].x - P.cxs[pm.i]) / f, (pm.pi[k].y - P.cys[pm.i]) / f, 1);
             double z = std::max(d[2], 0.05);  // (a point behind the camera: a large residual, bounded by Huber)
             double w = pm.w * (k < pm.wk.size() ? pm.wk[k] : 1.0);
-            r.push_back(w * (f * d[0] / z + P.cx - pm.pj[k].x));
-            r.push_back(w * (f * d[1] / z + P.cy - pm.pj[k].y));
+            r.push_back(w * (f * d[0] / z + P.cxs[pm.j] - pm.pj[k].x));
+            r.push_back(w * (f * d[1] / z + P.cys[pm.j] - pm.pj[k].y));
         }
     }
     if (P.lines) {  // (GCam: LineMatchResidual: each segment's transferred endpoints' distances to the other photo's line, both ways)
         for (auto &lm : *P.lines) {
             Matx33d Rji = R[lm.j].t() * R[lm.i], Rij = Rji.t();
-            auto side = [&](const Matx33d &Rt, const Point2d &a, const Point2d &b, const Point2d &la, const Point2d &lb) {
+            auto side = [&](const Matx33d &Rt, int from, int to, const Point2d &a, const Point2d &b, const Point2d &la, const Point2d &lb) {
                 for (const Point2d &p : {a, b}) {
-                    Vec3d d = Rt * Vec3d((p.x - P.cx) / f, (p.y - P.cy) / f, 1);
+                    Vec3d d = Rt * Vec3d((p.x - P.cxs[from]) / f, (p.y - P.cys[from]) / f, 1);
                     double z = std::max(d[2], 0.05);
-                    Point2d q(f * d[0] / z + P.cx, f * d[1] / z + P.cy);
+                    Point2d q(f * d[0] / z + P.cxs[to], f * d[1] / z + P.cys[to]);
                     Point2d dl = lb - la, v = q - la;
                     double len = cv::norm(dl);
                     r.push_back(lm.w * (len > 1e-9 ? (v.x * dl.y - v.y * dl.x) / len : cv::norm(v)));
                 }
             };
-            side(Rji, lm.ai, lm.bi, lm.aj, lm.bj);
-            side(Rij, lm.aj, lm.bj, lm.ai, lm.bi);
+            side(Rji, lm.i, lm.j, lm.ai, lm.bi, lm.aj, lm.bj);
+            side(Rij, lm.j, lm.i, lm.aj, lm.bj, lm.ai, lm.bi);
         }
     }
     for (int i = 0; i < P.n; i++) {  // the gravity priors: tilt, and roll with half the weight (GCam: SensorResidual, RollPitchSensorResidual)
         r.push_back(P.ws * f * (pitchOf(R[i]) - P.pitch0[i]));
         r.push_back(std::fabs(P.pitch0[i]) < rad(81) ? 0.5 * P.ws * f * (rollOf(R[i]) - P.roll0[i]) : 0.0);
     }
+}
+
+/// A pair's median reprojection distance in match pixels under the given rotations and focal.
+inline double medianResidual(const PairMatch &pm, const std::vector<Matx33d> &R, double f, const std::vector<double> &cxs, const std::vector<double> &cys) {
+    Matx33d Rji = R[pm.j].t() * R[pm.i];
+    std::vector<double> e;
+    for (size_t k = 0; k < pm.pi.size(); k++) {
+        Vec3d d = Rji * Vec3d((pm.pi[k].x - cxs[pm.i]) / f, (pm.pi[k].y - cys[pm.i]) / f, 1);
+        if (d[2] <= 0.05) {
+            e.push_back(1e4);
+            continue;
+        }
+        e.push_back(std::hypot(f * d[0] / d[2] + cxs[pm.j] - pm.pj[k].x, f * d[1] / d[2] + cys[pm.j] - pm.pj[k].y));
+    }
+    if (e.empty()) return 1e4;
+    std::nth_element(e.begin(), e.begin() + e.size() / 2, e.end());
+    return e[e.size() / 2];
 }
 
 double baCost(const std::vector<double> &r) {
@@ -702,6 +728,7 @@ std::vector<double> matchExposure(const std::vector<Mat> &imgs, const std::vecto
             Vec3d d(std::cos(lat) * std::sin(lon), -std::sin(lat), std::cos(lat) * std::cos(lon));
             std::vector<std::pair<int, double>> hits;
             for (int i = 0; i < n; i++) {
+                if (imgs[i].empty()) continue;
                 Vec3d c = R[i].t() * d;
                 if (c[2] <= 1e-6) continue;
                 double cx = (imgs[i].cols - 1) / 2.0, cy = (imgs[i].rows - 1) / 2.0;
@@ -760,6 +787,7 @@ inline std::vector<double> matchGains(const std::vector<Mat> &imgs, const std::v
             Vec3d d(std::cos(lat) * std::sin(lon), -std::sin(lat), std::cos(lat) * std::cos(lon));
             std::vector<std::pair<int, double>> hits;
             for (int i = 0; i < n; i++) {
+                if (imgs[i].empty()) continue;
                 Vec3d c = R[i].t() * d;
                 if (c[2] <= 1e-6) continue;
                 double cx = (imgs[i].cols - 1) / 2.0, cy = (imgs[i].rows - 1) / 2.0;
@@ -872,8 +900,10 @@ void fillHoles(Mat &result, const Mat &coverage) {
 
 // ---------------------------------------------------------------- the stitch
 
+/// sensors: the rotations come from a gyro (the app's captures). false: they were worked out from the images (bootstrap),
+/// so they get no sensor pairs or geometry checks, a weaker gravity prior, and a photo nothing holds is dropped.
 inline StitchResult stitch(const std::vector<std::string> &paths, const std::vector<Matx33d> &rotations, double focalPx,
-                           int outputWidth, const std::string &outputPath, const Progress &progress) {
+                           int outputWidth, const std::string &outputPath, const Progress &progress, bool sensors = true) {
     auto report = [&](double frac, const char *stage) {
         if (progress) progress(frac, stage);
     };
@@ -886,7 +916,7 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
     std::vector<View> views(n);
     std::vector<Mat> photos(n);
     cv::Ptr<cv::ORB> orb = cv::ORB::create(4000, 1.2f, 8, 31, 0, 2, cv::ORB::HARRIS_SCORE, 31, 10);  // (a low FAST threshold: plain walls)
-    double matchScale = 1, fm = focalPx, cxm = 0, cym = 0;
+    double matchScale = 1, fm = focalPx;
     for (int i = 0; i < n; i++) {
         Mat img = cv::imread(paths[i], cv::IMREAD_COLOR);
         if (img.empty()) throw std::runtime_error("can't read " + paths[i]);
@@ -896,15 +926,16 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
         }
         photos[i] = img;
         View &v = views[i];
-        v.scale = matchScale;
+        // (every photo's long side goes to the match width: one camera, so one match-scale focal, whichever way it was held)
+        v.scale = std::min(1.0, (double)kMatchWidth / std::max(img.cols, img.rows));
         v.Rp = rotations[i];
         Mat small, gray;
-        cv::resize(img, small, cv::Size(), matchScale, matchScale, cv::INTER_AREA);
+        cv::resize(img, small, cv::Size(), v.scale, v.scale, cv::INTER_AREA);
         cv::cvtColor(small, gray, cv::COLOR_BGR2GRAY);
         v.w = gray.cols;
         v.h = gray.rows;
-        cxm = (v.w - 1) / 2.0;
-        cym = (v.h - 1) / 2.0;
+        v.cx = (v.w - 1) / 2.0;
+        v.cy = (v.h - 1) / 2.0;
         orb->detectAndCompute(gray, cv::noArray(), v.kps, v.desc);
         v.lines = detectLines(gray);
         v.s16 = makeSmall(gray, fm, 0.0625);
@@ -913,7 +944,7 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
         v.rays.resize(v.kps.size());
         v.lat.resize(v.kps.size());
         for (size_t k = 0; k < v.kps.size(); k++) {
-            v.rays[k] = rayOf(v.kps[k].pt.x, v.kps[k].pt.y, fm, cxm, cym);
+            v.rays[k] = rayOf(v.kps[k].pt.x, v.kps[k].pt.y, fm, v.cx, v.cy);
             v.lat[k] = std::asin(clamp1(-(v.Rp * v.rays[k])[1]));
         }
         report(0.25 * (i + 1) / n, "finding features");
@@ -953,10 +984,12 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
             std::vector<int> inl;
             if (!ransacRotation(ra, rb, rng, Rvis, inl)) continue;
             if ((int)inl.size() <= 5 + 0.15 * (int)ra.size()) continue;  // (INLIER_FAIL)
-            Matx33d Rsens = b.Rp.t() * a.Rp, E = Rvis * Rsens.t();
-            double yawTol = rad(std::min(25.0 * (j - i), 65.0));
-            Vec3d upj = b.Rp.t() * Vec3d(0, -1, 0);
-            if (angleOf(E) > yawTol || angleBetween(E * upj, upj) > rad(12.5)) continue;  // (GEO_FAIL: not what the sensors say)
+            if (sensors) {
+                Matx33d Rsens = b.Rp.t() * a.Rp, E = Rvis * Rsens.t();
+                double yawTol = rad(std::min(25.0 * (j - i), 65.0));
+                Vec3d upj = b.Rp.t() * Vec3d(0, -1, 0);
+                if (angleOf(E) > yawTol || angleBetween(E * upj, upj) > rad(12.5)) continue;  // (GEO_FAIL: not what the sensors say)
+            }
             std::vector<cv::KeyPoint> kpsA;
             for (int k : inl) kpsA.push_back(a.kps[ka[k]]);
             std::vector<int> all(inl.size());
@@ -987,7 +1020,7 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
     for (auto &p : pairs) keptPoints += (int)p.pi.size();
     // sensor pairs: a weak tie between each photo and the one before when no image match links them (GCam: SENSOR_PAIR,
     // a 3x3 grid transferred through the sensors, weight 0.125 or 0.25 when the axes are near)
-    for (int i = 1; i < n; i++) {
+    for (int i = 1; i < n && sensors; i++) {
         bool linked = std::find(matched[i].begin(), matched[i].end(), i - 1) != matched[i].end();
         if (linked) continue;
         View &a = views[i - 1], &b = views[i];
@@ -1000,9 +1033,9 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
         for (int gy = 0; gy < 3; gy++)
             for (int gx = 0; gx < 3; gx++) {
                 Point2d p(a.w * (0.1 + 0.4 * gx), a.h * (0.1 + 0.4 * gy));
-                Vec3d d = Rji * Vec3d((p.x - cxm) / fm, (p.y - cym) / fm, 1);
+                Vec3d d = Rji * Vec3d((p.x - a.cx) / fm, (p.y - a.cy) / fm, 1);
                 if (d[2] <= 0.05) continue;
-                Point2d q(fm * d[0] / d[2] + cxm, fm * d[1] / d[2] + cym);
+                Point2d q(fm * d[0] / d[2] + b.cx, fm * d[1] / d[2] + b.cy);
                 pm.pi.push_back(p);
                 pm.pj.push_back(q);
             }
@@ -1016,10 +1049,12 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
     P.n = n;
     P.pairs = &pairs;
     P.f0 = fm;
-    P.cx = cxm;
-    P.cy = cym;
     P.ws = keptPoints > 0 ? 0.0125 * keptPoints / n : 0.5;
+    if (!sensors) P.ws *= 0.25;  // (the "gravity" came from the images: a weaker pull)
+    std::vector<bool> dead(n, false);
     for (int i = 0; i < n; i++) {
+        P.cxs.push_back(views[i].cx);
+        P.cys.push_back(views[i].cy);
         P.R0.push_back(views[i].Rp);
         P.pitch0.push_back(pitchOf(views[i].Rp));
         P.roll0.push_back(rollOf(views[i].Rp));
@@ -1036,6 +1071,22 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
         Matx33d G = rotY(yawOf(P.R0[0]) - yawOf(R[0]));
         for (auto &Ri : R) Ri = G * Ri;
 
+        // ---- without a gyro, a photo stays only when one of its matches holds under the adjusted rotations (a gyro held
+        // every photo for GCam); the others are dropped rather than painted where a chance match put them
+        if (!sensors) {
+            std::vector<double> best(n, 1e9);
+            for (auto &pm : pairs) {
+                double med = medianResidual(pm, R, fAdj, P.cxs, P.cys);
+                best[pm.i] = std::min(best[pm.i], med);
+                best[pm.j] = std::min(best[pm.j], med);
+            }
+            for (int i = 0; i < n; i++) dead[i] = best[i] > kSupportPx;
+            std::vector<PairMatch> alive;
+            for (auto &pm : pairs)
+                if (!dead[pm.i] && !dead[pm.j]) alive.push_back(pm);
+            pairs.swap(alive);
+        }
+
         // ---- plain walls: the photos' straight edges matched under the adjusted rotations (GCam's line features), and pairs
         // the features left weak aligned directly on the pixels; both feed a second adjustment, then the lines once more
         report(0.56, "aligning plain walls");
@@ -1043,8 +1094,9 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
             lines.clear();
             for (int i = 0; i < n; i++)
                 for (int j = i + 1; j < n; j++)
-                    if (angleBetween(forwardOf(Rc[i]), forwardOf(Rc[j])) < 0.9 * fovLong)
-                        matchLines(i, j, views[i].lines, views[j].lines, Rc[j].t() * Rc[i], fm, cxm, cym, views[j].w, views[j].h, lines);
+                    if (!dead[i] && !dead[j] && angleBetween(forwardOf(Rc[i]), forwardOf(Rc[j])) < 0.9 * fovLong)
+                        matchLines(i, j, views[i].lines, views[j].lines, Rc[j].t() * Rc[i], fm, views[i].cx, views[i].cy, views[j].cx, views[j].cy, views[j].w,
+                                   views[j].h, lines);
             return (int)lines.size();
         };
         lineMatches = matchAllLines(R);
@@ -1052,7 +1104,7 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
         for (int i = 0; i < n; i++) {
             for (int j = i + 1; j < n; j++) {
                 View &a = views[i], &b = views[j];
-                if (angleBetween(forwardOf(R[i]), forwardOf(R[j])) >= 0.8 * fovLong) continue;
+                if (dead[i] || dead[j] || angleBetween(forwardOf(R[i]), forwardOf(R[j])) >= 0.8 * fovLong) continue;
                 int inl = 0;
                 for (auto &pm : pairs)
                     if (!pm.sensor && pm.i == i && pm.j == j) inl = std::max(inl, pm.inliers);
@@ -1071,9 +1123,9 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
                 for (int gy = 0; gy < 5; gy++)
                     for (int gx = 0; gx < 5; gx++) {
                         Point2d p(a.w * (0.1 + 0.2 * gx), a.h * (0.1 + 0.2 * gy));
-                        Vec3d d = Rji * Vec3d((p.x - cxm) / fm, (p.y - cym) / fm, 1);
+                        Vec3d d = Rji * Vec3d((p.x - a.cx) / fm, (p.y - a.cy) / fm, 1);
                         if (d[2] <= 0.05) continue;
-                        Point2d q(fm * d[0] / d[2] + cxm, fm * d[1] / d[2] + cym);
+                        Point2d q(fm * d[0] / d[2] + b.cx, fm * d[1] / d[2] + b.cy);
                         if (q.x < 0 || q.y < 0 || q.x > b.w - 1 || q.y > b.h - 1) continue;
                         pm.pi.push_back(p);
                         pm.pj.push_back(q);
@@ -1106,6 +1158,12 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
         R = P.R0;
     }
     double fFull = fAdj / matchScale;
+    std::string pairReport;
+    for (auto &pm : pairs) {
+        char line[96];
+        snprintf(line, sizeof line, "%d %d %c %d %.1f\n", pm.i, pm.j, pm.sensor ? 'S' : pm.direct ? 'D' : 'F', pm.inliers, medianResidual(pm, R, fAdj, P.cxs, P.cys));
+        pairReport += line;
+    }
 
     // ---- render: each photo warped onto the canvas, exposure matched, seams cut, blended in bands
     Equirect eq(outputWidth);
@@ -1114,16 +1172,21 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
     Mat coverage = Mat::zeros(eq.H, eq.W, CV_8U);
     report(0.6, "matching exposure");
     std::vector<Mat> smalls(n);
-    for (int i = 0; i < n; i++) cv::resize(photos[i], smalls[i], cv::Size(), matchScale * 0.25, matchScale * 0.25, cv::INTER_AREA);
+    for (int i = 0; i < n; i++)
+        if (!dead[i]) cv::resize(photos[i], smalls[i], cv::Size(), views[i].scale * 0.25, views[i].scale * 0.25, cv::INTER_AREA);
     std::vector<double> gammas;
     double maxRatio = 1;
     gammas = matchGains(smalls, R, fm * 0.25, maxRatio);
     smalls.clear();
     for (int i = 0; i < n; i++) {
+        if (dead[i]) {
+            photos[i].release();
+            continue;
+        }
         Mat src = photos[i];
         if (composeScale < 0.999) cv::resize(photos[i], src, cv::Size(), composeScale, composeScale, cv::INTER_AREA);
         applyGain(src, gammas[i]);
-        double f = fFull * composeScale, cx = (src.cols - 1) / 2.0, cy = (src.rows - 1) / 2.0;
+        double f = fAdj / views[i].scale * composeScale, cx = (src.cols - 1) / 2.0, cy = (src.rows - 1) / 2.0;
         size_t before = pieces.size();
         warpPhoto(src, f, cx, cy, R[i], eq, i, pieces);
         for (size_t k = before; k < pieces.size(); k++) {
@@ -1230,14 +1293,19 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
     res.focal = fFull;
     res.seconds = ((double)cv::getTickCount() - t0) / cv::getTickFrequency();
     res.R = R;
+    res.pairReport = pairReport;
+    for (int i = 0; i < n; i++)
+        if (dead[i]) res.dropped.push_back(i);
     {
         double gmin = 9, gmax = 0;
-        for (double g : gammas) {
-            gmin = std::min(gmin, g);
-            gmax = std::max(gmax, g);
+        for (int i = 0; i < n; i++) {
+            if (dead[i]) continue;
+            gmin = std::min(gmin, gammas[i]);
+            gmax = std::max(gmax, gammas[i]);
         }
-        char buf[160];
-        snprintf(buf, sizeof buf, "gains %.2f..%.2f (overlaps differed up to %.2fx), %d line matches, compose scale %.2f, %d pieces, %d bands", gmin, gmax, maxRatio, lineMatches, composeScale, np, bands);
+        char buf[200];
+        snprintf(buf, sizeof buf, "gains %.2f..%.2f (overlaps differed up to %.2fx), %d line matches, %d dropped, compose scale %.2f, %d pieces, %d bands", gmin, gmax, maxRatio,
+                 lineMatches, (int)res.dropped.size(), composeScale, np, bands);
         res.notes = buf;
     }
     report(1.0, "done");
@@ -1306,6 +1374,34 @@ inline Bootstrap bootstrap(const std::vector<std::string> &paths, double focalPx
         }
     }
     if (edges.empty()) return out;
+    // verification: GCam checked each pair against the gyro; without one, a pair is believed when a third photo agrees with
+    // it (the three relative rotations around the triangle close within kCycleDeg), or when it is strong on its own
+    {
+        int m = (int)edges.size();
+        std::map<std::pair<int, int>, int> at;
+        for (int e = 0; e < m; e++) at[{edges[e].i, edges[e].j}] = e;
+        auto rel = [&](int a, int b, Matx33d &Rba) {  // camera b from camera a, when they share an edge
+            auto it = at.find({std::min(a, b), std::max(a, b)});
+            if (it == at.end()) return false;
+            const Edge &e = edges[it->second];
+            Rba = a == e.i ? e.Rji : e.Rji.t();
+            return true;
+        };
+        std::vector<Edge> kept;
+        for (int e = 0; e < m; e++) {
+            bool ok = edges[e].inliers >= kStrongEdge;
+            for (int k = 0; k < n && !ok; k++) {
+                if (k == edges[e].i || k == edges[e].j) continue;
+                Matx33d Rki, Rjk;
+                if (!rel(edges[e].i, k, Rki) || !rel(k, edges[e].j, Rjk)) continue;
+                ok = deg(angleOf(edges[e].Rji.t() * (Rjk * Rki))) < kCycleDeg;
+            }
+            if (ok) kept.push_back(edges[e]);
+        }
+        out.rejected = m - (int)kept.size();
+        edges.swap(kept);
+        if (edges.empty()) return out;
+    }
     // the spanning tree of most inliers, from the photo with the most of them
     std::vector<int> degree(n, 0);
     for (auto &e : edges) {
@@ -1503,6 +1599,7 @@ inline Metrics metrics(const StitchResult &result, const std::string &truthPath,
     double sum2 = 0, worst = 0;
     for (int i = 0; i < n; i++) {
         double e = deg(angleOf(G * truth[i] * result.R[i].t()));
+        m.perPhotoDeg.push_back(e);
         sum2 += e * e;
         worst = std::max(worst, e);
     }

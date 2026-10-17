@@ -56,10 +56,11 @@ NSError *err(const std::string &msg) {
                                     focalPx:(double)focalPx
                                 outputWidth:(int)outputWidth
                                  outputPath:(NSString *)outputPath
+                          priorsFromSensors:(BOOL)priorsFromSensors
                                    progress:(nullable PanoProgress)progress
                                       error:(NSError **)error {
     try {
-        pano::StitchResult r = pano::stitch(strings(paths), matricesFrom(rotations), focalPx, outputWidth, outputPath.UTF8String, progressFrom(progress));
+        pano::StitchResult r = pano::stitch(strings(paths), matricesFrom(rotations), focalPx, outputWidth, outputPath.UTF8String, progressFrom(progress), priorsFromSensors);
         PanoStitchResult *res = [PanoStitchResult new];
         res.path = [NSString stringWithUTF8String:r.path.c_str()];
         res.fullWidth = r.fullW;
@@ -76,6 +77,9 @@ NSError *err(const std::string &msg) {
         res.seconds = r.seconds;
         res.rotations = arraysFrom(r.R);
         res.notes = [NSString stringWithUTF8String:r.notes.c_str()];
+        NSMutableArray *dropped = [NSMutableArray array];
+        for (int i : r.dropped) [dropped addObject:@(i)];
+        res.dropped = dropped;
         return res;
     } catch (const std::exception &e) {
         if (error) *error = err(std::string("stitching failed: ") + e.what());
@@ -89,7 +93,7 @@ NSError *err(const std::string &msg) {
         if (b.placed.empty()) return nil;
         NSMutableArray *idx = [NSMutableArray array];
         for (int i : b.placed) [idx addObject:@(i)];
-        return @{@"placed" : idx, @"rotations" : arraysFrom(b.R), @"edges" : @(b.edges), @"root" : @(b.root)};
+        return @{@"placed" : idx, @"rotations" : arraysFrom(b.R), @"edges" : @(b.edges), @"rejected" : @(b.rejected), @"root" : @(b.root)};
     } catch (const std::exception &) {
         return nil;
     }

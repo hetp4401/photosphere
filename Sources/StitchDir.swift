@@ -49,17 +49,17 @@ final class StitchDirModel: ObservableObject {
                       let placed = boot["placed"] as? [NSNumber], let rots = boot["rotations"] as? [[NSNumber]], !placed.isEmpty else {
                     throw NSError(domain: "stitchdir", code: 1, userInfo: [NSLocalizedDescriptionKey: "no photo could be placed"])
                 }
-                lines.append("bootstrap: placed \(placed.count) of \(paths.count), \(boot["edges"] ?? 0) matched pairs, root photo \(boot["root"] ?? -1), \(Int(Date().timeIntervalSince(t0))) s")
+                lines.append("bootstrap: placed \(placed.count) of \(paths.count), \(boot["edges"] ?? 0) matched pairs (\(boot["rejected"] ?? 0) rejected), root photo \(boot["root"] ?? -1), \(Int(Date().timeIntervalSince(t0))) s")
                 let used = placed.map { paths[$0.intValue] }
                 let raw = dir.appendingPathComponent("result.jpg").path
-                let res = try PanoStitcher.stitchImages(used, rotations: rots, focalPx: focal, outputWidth: Int32(width), outputPath: raw, progress: show)
+                let res = try PanoStitcher.stitchImages(used, rotations: rots, focalPx: focal, outputWidth: Int32(width), outputPath: raw, priorsFromSensors: false, progress: show)
                 let packet = XMP.gpanoPacket(fullWidth: Int(res.fullWidth), fullHeight: Int(res.fullHeight), cropWidth: Int(res.cropWidth), cropHeight: Int(res.cropHeight),
                                              left: Int(res.cropLeft), top: Int(res.cropTop), headingDeg: 0, firstDate: Date(), lastDate: Date(), sourceCount: used.count, usePanoramaViewer: true)
                 let data = XMP.embed(packet: packet, in: try Data(contentsOf: URL(fileURLWithPath: raw)))
                 let out = CaptureSession.panoramasDir.appendingPathComponent("\(name).jpg")
                 try data.write(to: out, options: .atomic)
                 lines.append(String(format: "stitch: %d photos, %d feature pairs, %d direct pairs, focal %.0f px, crop %dx%d of %dx%d, full circle %d, %.1f s",
-                                    res.imagesUsed, res.pairsMatched, res.pairsDirect, res.focalPx, res.cropWidth, res.cropHeight, res.fullWidth, res.fullHeight, res.fullCircle ? 1 : 0, res.seconds + " " + res.notes)
+                                    res.imagesUsed, res.pairsMatched, res.pairsDirect, res.focalPx, res.cropWidth, res.cropHeight, res.fullWidth, res.fullHeight, res.fullCircle ? 1 : 0, res.seconds) + " " + res.notes + " dropped: " + res.dropped.map { used[$0.intValue].split(separator: "/").last.map(String.init) ?? "?" }.joined(separator: " "))
                 lines.append("DONE")
                 await MainActor.run { self.panoURL = out }
             } catch {
