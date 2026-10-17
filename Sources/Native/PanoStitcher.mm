@@ -391,6 +391,116 @@ void warpPhoto(const Mat &img, double f, double cx, double cy, const Matx33d &R,
     }
 }
 
+/// GCam's exposure matching (ComputeRosetteGammaAdjustment): about 2000 directions spread over the sphere (39 latitude
+/// rings 4.54 deg apart), each photo's mean luma over the directions it shares with another, and one gamma per photo
+/// minimising sum N_ij (g_i ln L_ij - g_j ln L_ji)^2 + 1/2 sum N_i (g_i - 1)^2, clamped to [1/1.75, 1.75]. Photos without
+/// overlap keep gamma 1. The gammas, one per photo.
+std::vector<double> matchExposure(const std::vector<Mat> &imgs, const std::vector<Matx33d> &R, double f, std::vector<double> &gammaOut) {
+    int n = (int)imgs.size();
+    std::vector<std::vector<double>> sum(n, std::vector<double>(n, 0));
+    std::vector<std::vector<int>> cnt(n, std::vector<int>(n, 0));
+    const int rings = 39;
+    for (int k = 0; k < rings; k++) {
+        double lat = -kPi / 2 + (k + 0.5) * kPi / rings;
+        int m = std::max(1, (int)std::lround(2 * kPi * std::cos(lat) / 0.0792));
+        for (int t = 0; t < m; t++) {
+            double lon = (t + 0.5) * 2 * kPi / m - kPi;
+            Vec3d d(std::cos(lat) * std::sin(lon), -std::sin(lat), std::cos(lat) * std::cos(lon));
+            std::vector<std::pair<int, double>> hits;
+            for (int i = 0; i < n; i++) {
+                Vec3d c = R[i].t() * d;
+                if (c[2] <= 1e-6) continue;
+                double cx = (imgs[i].cols - 1) / 2.0, cy = (imgs[i].rows - 1) / 2.0;
+                int px = (int)std::lround(f * c[0] / c[2] + cx), py = (int)std::lround(f * c[1] / c[2] + cy);
+                if (px < 0 || py < 0 || px >= imgs[i].cols || py >= imgs[i].rows) continue;
+                cv::Vec3b p = imgs[i].at<cv::Vec3b>(py, px);
+                hits.push_back({i, (0.114 * p[0] + 0.5871 * p[1] + 0.2989 * p[2]) / 255.0});
+            }
+            for (auto &a : hits)
+                for (auto &b : hits)
+                    if (a.first != b.first) {
+                        sum[a.first][b.first] += a.second;
+                        cnt[a.first][b.first]++;
+                    }
+        }
+    }
+    Mat A = Mat::zeros(n, n, CV_64F), b = Mat::zeros(n, 1, CV_64F);
+    for (int i = 0; i < n; i++) {
+        bool any = false;
+        for (int j = 0; j < n; j++) {
+            int N = cnt[i][j];
+            if (i == j || N <= 5) continue;
+            double Lij = sum[i][j] / N, Lji = sum[j][i] / std::max(1, cnt[j][i]);
+            if (Lij < 2.5 / 255 || Lji < 2.5 / 255) continue;
+            double a = std::log(Lij), c = std::log(Lji);
+            A.at<double>(i, i) += 2 * N * a * a + N;
+            A.at<double>(i, j) += -2 * N * a * c;
+            b.at<double>(i) += N;
+            any = true;
+        }
+        if (!any) {
+            A.at<double>(i, i) = 1;
+            b.at<double>(i) = 1;
+        }
+    }
+    Mat g;
+    gammaOut.assign(n, 1.0);
+    if (cv::solve(A, b, g, cv::DECOMP_SVD))
+        for (int i = 0; i < n; i++) gammaOut[i] = std::max(1 / 1.75, std::min(1.75, std::isfinite(g.at<double>(i)) ? g.at<double>(i) : 1.0));
+    return gammaOut;
+}
+
+void applyGamma(Mat &img, double g) {
+    if (std::fabs(g - 1) < 1e-3) return;
+    Mat lut(1, 256, CV_8U);
+    for (int i = 0; i < 256; i++) lut.at<uchar>(i) = (uchar)std::lround(std::pow(i / 255.0, g) * 255.0);
+    cv::LUT(img, lut, img);
+}
+
+/// GCam's hole treatment: what no photo covered is filled from the coarsest blend level when small (under 0.5% of the
+/// canvas), left black when large. Here: small holes take the colour of their blurred surroundings.
+void fillHoles(Mat &result, const Mat &coverage) {
+    Mat holes = coverage == 0, labels, stats, centroids;
+    int nc = cv::connectedComponentsWithStats(holes, labels, stats, centroids, 8);
+    if (nc <= 1) return;
+    double limit = 0.005 * result.cols * result.rows;
+    Mat small = Mat::zeros(holes.size(), CV_8U);
+    for (int c = 1; c < nc; c++)
+        if (stats.at<int>(c, cv::CC_STAT_AREA) < limit) small.setTo(255, labels == c);
+    if (cv::countNonZero(small) == 0) return;
+    int s = 8;
+    Mat img, msk;
+    cv::resize(result, img, cv::Size(result.cols / s, result.rows / s), 0, 0, cv::INTER_AREA);
+    cv::resize(coverage, msk, img.size(), 0, 0, cv::INTER_NEAREST);
+    img.convertTo(img, CV_32FC3);
+    Mat m;
+    msk.convertTo(m, CV_32F, 1.0 / 255);
+    for (int it = 0; it < 40; it++) {  // (the covered colours spread outward, a few pixels an iteration)
+        Mat wimg, wm;
+        std::vector<Mat> ch(3);
+        cv::split(img, ch);
+        for (auto &c : ch) {
+            cv::multiply(c, m, c);
+            cv::GaussianBlur(c, c, cv::Size(5, 5), 0);
+        }
+        cv::merge(ch, wimg);
+        cv::GaussianBlur(m, wm, cv::Size(5, 5), 0);
+        Mat fillable = (m == 0) & (wm > 1e-3);
+        if (cv::countNonZero(fillable) == 0) break;
+        std::vector<Mat> wch(3);
+        cv::split(wimg, wch);
+        for (auto &c : wch) cv::divide(c, wm, c);
+        Mat filled;
+        cv::merge(wch, filled);
+        filled.copyTo(img, fillable);
+        m.setTo(1, fillable);
+    }
+    Mat up;
+    cv::resize(img, up, result.size(), 0, 0, cv::INTER_LINEAR);
+    up.convertTo(up, CV_8UC3);
+    up.copyTo(result, small);
+}
+
 NSError *err(NSString *msg) { return [NSError errorWithDomain:@"PanoStitcher" code:1 userInfo:@{NSLocalizedDescriptionKey : msg}]; }
 
 Matx33d matrixFrom(NSArray<NSNumber *> *a) {
@@ -434,7 +544,7 @@ NSArray<NSNumber *> *arrayFrom(const Matx33d &R) {
     // ---- features (GCam: FastCornerDetector + OrientedPatchExtractor; here ORB: FAST corners with oriented binary patches)
     std::vector<View> views(n);
     std::vector<Mat> photos(n);
-    cv::Ptr<cv::ORB> orb = cv::ORB::create(3000, 1.2f, 8, 31, 0, 2, cv::ORB::HARRIS_SCORE, 31, 20);
+    cv::Ptr<cv::ORB> orb = cv::ORB::create(4000, 1.2f, 8, 31, 0, 2, cv::ORB::HARRIS_SCORE, 31, 10);  // (a low FAST threshold: plain walls)
     double matchScale = 1, fm = focalPx, cxm = 0, cym = 0;
     for (int i = 0; i < n; i++) {
         Mat img = cv::imread(paths[i].UTF8String, cv::IMREAD_COLOR);
@@ -592,9 +702,16 @@ NSArray<NSNumber *> *arrayFrom(const Matx33d &R) {
     double composeScale = std::min(1.0, 1.3 * (eq.W / (2 * kPi)) / fFull);  // (sources no more than 1.3x the output's resolution)
     std::vector<Piece> pieces;
     Mat coverage = Mat::zeros(eq.H, eq.W, CV_8U);
+    report(0.5, @"matching exposure");
+    std::vector<Mat> smalls(n);
+    for (int i = 0; i < n; i++) cv::resize(photos[i], smalls[i], cv::Size(), matchScale * 0.25, matchScale * 0.25, cv::INTER_AREA);
+    std::vector<double> gammas;
+    matchExposure(smalls, R, fm * 0.25, gammas);
+    smalls.clear();
     for (int i = 0; i < n; i++) {
         Mat src = photos[i];
         if (composeScale < 0.999) cv::resize(photos[i], src, cv::Size(), composeScale, composeScale, cv::INTER_AREA);
+        applyGamma(src, gammas[i]);
         double f = fFull * composeScale, cx = (src.cols - 1) / 2.0, cy = (src.rows - 1) / 2.0;
         size_t before = pieces.size();
         warpPhoto(src, f, cx, cy, R[i], eq, i, pieces);
@@ -616,15 +733,6 @@ NSArray<NSNumber *> *arrayFrom(const Matx33d &R) {
         corners[k] = pieces[k].tl;
         pieces[k].img.copyTo(imgs[k]);
         pieces[k].mask.copyTo(masks[k]);
-    }
-    report(0.72, @"matching exposure");
-    try {  // (GCam: one gamma an image from the overlaps' mean luma; here one gain an image, the same idea)
-        cv::detail::GainCompensator comp;
-        std::vector<std::pair<cv::UMat, uchar>> maskPairs;
-        for (auto &m : masks) maskPairs.push_back({m, 255});
-        comp.feed(corners, imgs, maskPairs);
-        for (int k = 0; k < np; k++) comp.apply(k, corners[k], imgs[k], masks[k]);
-    } catch (const std::exception &) {
     }
     report(0.76, @"finding seams");
     double seamScale = std::min(1.0, 1024.0 / eq.W);  // (GCam cut its seams on a 512-wide mosaic)
@@ -675,7 +783,8 @@ NSArray<NSNumber *> *arrayFrom(const Matx33d &R) {
     blender.blend(result16, resultMask);
     Mat result;
     result16(cv::Rect(pad, 0, eq.W, eq.H)).convertTo(result, CV_8U);
-    result.setTo(cv::Scalar(0, 0, 0), coverage == 0);  // (what no photo covered: black, as GCam left its holes)
+    result.setTo(cv::Scalar(0, 0, 0), coverage == 0);
+    fillHoles(result, coverage);  // (small holes filled from their surroundings, large ones black, as GCam)
 
     // ---- crop: a full circle keeps its width and loses rows not fully covered (10 deg at most each end); a partial
     // sphere is cut to what's covered

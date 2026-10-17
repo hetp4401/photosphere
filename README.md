@@ -21,10 +21,10 @@ Turn on Settings › Privacy & Security › Developer Mode.
 | Global adjustment | Ceres: each photo's rotation and one shared focal, Huber(35 px) reprojection, gravity (tilt) priors with weight 0.0125·matches/images, yaw free then anchored to photo 0 | A small Levenberg–Marquardt with the same residuals, weights and gauge |
 | Weakly matched photos | "Sensor pairs": a 3×3 grid transferred through the sensors, weight 0.125/0.25 | The same |
 | Projection | Equirectangular, output 8/26/70 MP by setting | Equirectangular, 4096/6144/8192 wide by setting |
-| Exposure | One gamma per photo from the overlaps' mean luma | OpenCV's per-photo gain from the overlaps |
+| Exposure | One gamma per photo from the overlaps' mean luma, solved over ~2000 directions on the sphere, clamped to 1.75 | The same (plus exposure, focus and white balance locked at the first photo) |
 | Seams | Graph cut on a 512-wide mosaic, colour + Laplacian cost | OpenCV's graph cut on a 1024-wide mosaic, colour + gradient cost |
 | Blending | Fixed-point Laplacian pyramid in YCbCr, 10 levels | OpenCV's multiband blender |
-| Crop | A full circle keeps its width and loses rows not fully covered (10° at most); a partial sphere is cut to its coverage | The same |
+| Holes and crop | Small holes filled from the coarsest level, large ones black; a full circle keeps its width and loses rows not fully covered (10° at most) | The same |
 | Metadata | GPano XMP (`FullPano*`, `CroppedArea*`, `PoseHeadingDegrees`, …) | The same XMP, written by `XMP.swift` |
 
 Not carried over: Google's line features for textureless photos, its ground-point down-weighting, and its gyro-bias

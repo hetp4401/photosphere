@@ -115,10 +115,11 @@ final class TargetManager {
         return (2.75 + 0.75 * t) * .pi / 180
     }
 
-    /// GCam's speed limit, by the current exposure: long exposures need a steady hand.
+    /// The speed limit for a sharp photo, by the current exposure (GCam's rule, tightened: its 0.4 rad/s let 1/30 s
+    /// photos smear by a dozen pixels; the phone also turns on a little after the dot is hit).
     static func speedLimit(exposureSeconds e: Double) -> Double {
         if e > 1.0 / 40 { return 0.05 }
-        if e < 1.0 / 100 { return 1.0 }
-        return 0.4
+        if e < 1.0 / 100 { return 0.3 }
+        return 0.15
     }
 }

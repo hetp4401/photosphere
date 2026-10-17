@@ -30,6 +30,8 @@ final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelega
     private var pendingRotation = matrix_identity_double3x3
     private var lastShotAt = Date.distantPast
     private var gyroSpeed = 0.0
+    private var stillFor = 0          // motion updates in a row under the speed limit
+    private var movedWhileExposing = 0.0  // the fastest the phone turned while a photo was taken
     private var heading: Double?
     private var finished = false
 
@@ -192,7 +194,10 @@ final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelega
         let f = Orient.forward(R), pitch = Orient.pitch(R), roll = Orient.roll(R)
         let hit = TargetManager.hitAngle(gyroSpeed: gyroSpeed)
         let exposure = device?.exposureDuration.seconds ?? 1.0 / 60
-        let tooFast = gyroSpeed > TargetManager.speedLimit(exposureSeconds: exposure)
+        let limit = TargetManager.speedLimit(exposureSeconds: exposure)
+        stillFor = gyroSpeed > limit ? 0 : stillFor + 1
+        let tooFast = stillFor < 4  // (under the limit for 40 ms: not just passing through)
+        if photoInFlight { movedWhileExposing = max(movedWhileExposing, gyroSpeed) }
         let canShoot = device != nil && !photoInFlight && Date().timeIntervalSince(lastShotAt) > 0.4
 
         if let targets {
@@ -255,7 +260,8 @@ final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelega
     /// field of view (autofocus changes it a little), and the white balance stays as it was.
     private func lockLens() {
         guard let dev = device, (try? dev.lockForConfiguration()) != nil else { return }
-        if dev.isFocusModeSupported(.locked) { dev.setFocusModeLocked(lensPosition: 1.0, completionHandler: nil) }
+        if dev.isFocusModeSupported(.locked) { dev.focusMode = .locked }  // (where it focused on the first view: a room's distance)
+        if dev.isExposureModeSupported(.locked) { dev.exposureMode = .locked }  // (one exposure for the whole sphere)
         if dev.isWhiteBalanceModeSupported(.locked) { dev.whiteBalanceMode = .locked }
         dev.unlockForConfiguration()
     }
@@ -263,6 +269,7 @@ final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelega
     private func unlockLens() {
         guard let dev = device, (try? dev.lockForConfiguration()) != nil else { return }
         if dev.isFocusModeSupported(.continuousAutoFocus) { dev.focusMode = .continuousAutoFocus }
+        if dev.isExposureModeSupported(.continuousAutoExposure) { dev.exposureMode = .continuousAutoExposure }
         if dev.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) { dev.whiteBalanceMode = .continuousAutoWhiteBalance }
         dev.unlockForConfiguration()
     }
@@ -272,6 +279,7 @@ final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelega
     private func takePhoto(rotation R: Mat3) {
         photoInFlight = true
         pendingRotation = R
+        movedWhileExposing = 0
         lastShotAt = Date()
         targets?.capture(forward: Orient.forward(R))
         if let t = targets { counterLabel.text = "\(t.capturedCount) of \(t.total)" }
@@ -290,6 +298,10 @@ final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelega
             DispatchQueue.main.async { self.photoFailed() }
             return
         }
+        if movedWhileExposing > 2 * TargetManager.speedLimit(exposureSeconds: exposure) {  // (it turned while exposing: blurred)
+            DispatchQueue.main.async { self.photoFailed(blurred: true) }
+            return
+        }
         DispatchQueue.global(qos: .userInitiated).async {
             let thumb = self.session.add(photo: image, rotation: rotation, exposure: exposure)
             DispatchQueue.main.async {
@@ -302,11 +314,11 @@ final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelega
         }
     }
 
-    private func photoFailed() {
+    private func photoFailed(blurred: Bool = false) {
         photoInFlight = false
         targets?.undo()
         if session.count == 0 { resetToStart() }
-        hintLabel.text = "The photo failed, try again"
+        hintLabel.text = blurred ? "Moved too much, hold still" : "The photo failed, try again"
     }
 
     private func resetToStart() {
