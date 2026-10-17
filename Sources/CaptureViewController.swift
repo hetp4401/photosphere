@@ -8,7 +8,7 @@ import simd
 
 /// The capture screen, as Google Camera's Photo Sphere worked: the phone's motion sensors say where the camera points,
 /// dots on a sphere say where to point it next, and a photo is taken by itself when the camera settles on a dot.
-final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelegate, CLLocationManagerDelegate {
+final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelegate, AVCaptureVideoDataOutputSampleBufferDelegate, CLLocationManagerDelegate {
     var onFinished: ((CaptureSession) -> Void)?
     var onCancel: (() -> Void)?
 
@@ -34,6 +34,15 @@ final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelega
     private var movedWhileExposing = 0.0  // the fastest the phone turned while a photo was taken
     private var heading: Double?
     private var finished = false
+    // GCam's live tracker: the preview frames aligned to the photos taken, the gyro's drift corrected by what is seen
+    private let videoOutput = AVCaptureVideoDataOutput()
+    private let videoQueue = DispatchQueue(label: "photosphere.video")
+    private var tracker: PanoTracker?
+    private var drift = matrix_identity_double3x3   // world rotation: corrected = drift * gyro (main thread)
+    private let refLock = NSLock()
+    private var latestRef = matrix_identity_double3x3
+    private var latestSpeed = 0.0
+    private var lastTrackAt = 0.0
 
     private let hintLabel = UILabel()
     private let counterLabel = UILabel()
@@ -48,13 +57,12 @@ final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelega
         super.viewDidLoad()
         view.backgroundColor = .black
         let preview = AVCaptureVideoPreviewLayer(session: captureSession)
-        preview.videoGravity = .resizeAspectFill
+        preview.videoGravity = .resizeAspect  // (the lens's whole frame, as GCam's viewfinder: what you see is the photo)
         preview.frame = view.bounds
         view.layer.addSublayer(preview)
         previewLayer = preview
 
         scnView = SCNView(frame: view.bounds)
-        scnView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         overlay = SphereOverlay(view: scnView, transparent: true)
         view.addSubview(scnView)
         buildUI()
@@ -66,20 +74,19 @@ final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelega
         }
     }
 
-    /// The preview fills the screen, so only the middle of the lens's width is on it: the overlay's camera gets exactly
-    /// that, or the dots would slide against the scene as the phone turns.
-    private func updateVisibleFov() {
-        guard view.bounds.height > 0 else { return }
-        let screenAspect = Double(view.bounds.width / view.bounds.height)
-        let feedAspect = tan(hfov / 2) / tan(vfov / 2)  // (the photo's, as held)
-        let frac = min(1.0, screenAspect / feedAspect)
-        overlay.setVisibleHfov(2 * atan(frac * tan(hfov / 2)) * 180 / .pi)
+    /// The overlay's view is laid exactly over the preview's frame, with the photo's own field of view, so the dots and
+    /// the pasted photos sit on the scene.
+    private func layoutPreview() {
+        guard let preview = previewLayer else { return }
+        let rect = preview.layerRectConverted(fromMetadataOutputRect: CGRect(x: 0, y: 0, width: 1, height: 1))
+        scnView.frame = rect.width > 0 && rect.height > 0 && rect.width <= view.bounds.width + 1 ? rect : view.bounds
+        overlay.setVisibleHfov(hfov * 180 / .pi)
     }
 
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
         previewLayer?.frame = view.bounds
-        updateVisibleFov()
+        layoutPreview()
     }
 
     private func buildUI() {
@@ -156,6 +163,11 @@ final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelega
             }
             self.captureSession.addInput(input)
             if self.captureSession.canAddOutput(self.photoOutput) { self.captureSession.addOutput(self.photoOutput) }
+            self.videoOutput.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange]
+            self.videoOutput.alwaysDiscardsLateVideoFrames = true
+            self.videoOutput.setSampleBufferDelegate(self, queue: self.videoQueue)
+            if self.captureSession.canAddOutput(self.videoOutput) { self.captureSession.addOutput(self.videoOutput) }
+            if let c = self.videoOutput.connection(with: .video) { Self.portrait(c) }
             self.photoOutput.maxPhotoQualityPrioritization = .balanced  // (the camera's own processing, as the Camera app)
             self.captureSession.commitConfiguration()
             self.device = dev
@@ -168,7 +180,7 @@ final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelega
                 self.hfov = shortFov
                 self.vfov = longFov
                 self.overlay.setFov(hfovDeg: shortFov * 180 / .pi, vfovDeg: longFov * 180 / .pi)
-                self.updateVisibleFov()
+                self.layoutPreview()
                 self.session.setCamera(width: 0, height: 0, focalPx: 0, hfovDeg: shortFov * 180 / .pi, vfovDeg: longFov * 180 / .pi)
                 if let c = self.previewLayer?.connection { Self.portrait(c) }
             }
@@ -199,9 +211,13 @@ final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelega
 
     private func handle(_ m: CMDeviceMotion) {
         let refFromDevice = Orient.refFromDevice(m)
-        let R = world.worldFromCam(refFromDevice: refFromDevice)
+        let R = drift * world.worldFromCam(refFromDevice: refFromDevice)  // (the gyro, corrected by the tracker)
         let rr = m.rotationRate
         gyroSpeed = simd_length(SIMD3(rr.x, rr.y, rr.z))
+        refLock.lock()
+        latestRef = refFromDevice
+        latestSpeed = gyroSpeed
+        refLock.unlock()
         overlay.setCamera(R)
         let f = Orient.forward(R), pitch = Orient.pitch(R), roll = Orient.roll(R)
         let hit = TargetManager.hitAngle(gyroSpeed: gyroSpeed)
@@ -249,6 +265,23 @@ final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelega
         }
     }
 
+    // MARK: the live tracker (on the video queue)
+
+    func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        let now = CACurrentMediaTime()
+        guard now - lastTrackAt > 0.08, let tracker, let pb = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        lastTrackAt = now
+        refLock.lock()
+        let ref = latestRef, speed = latestSpeed
+        refLock.unlock()
+        guard speed < 0.6 else { return }  // (only when the frame is sharp enough to align)
+        let Rg = world.worldFromCam(refFromDevice: ref)
+        if tracker.track(pb, gyro: Orient.flat(Rg)) {
+            let d = Orient.matrix(tracker.drift())
+            DispatchQueue.main.async { self.drift = d }
+        }
+    }
+
     private static func within(_ a: Double, _ b: Double, _ tol: Double) -> Bool {
         var d = abs(a - b).truncatingRemainder(dividingBy: 2 * .pi)
         if d > .pi { d = 2 * .pi - d }
@@ -258,6 +291,8 @@ final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelega
     private func firstPhoto(refFromDevice: Mat3) {
         lockLens()
         world.fix(refFromDevice: refFromDevice)
+        drift = matrix_identity_double3x3
+        tracker = PanoTracker(shortFovDeg: hfov * 180 / .pi)
         let R = world.worldFromCam(refFromDevice: refFromDevice)
         let roll = Orient.roll(R)
         let uprights: [Double] = [0, .pi / 2, -.pi / 2, .pi]
@@ -318,7 +353,10 @@ final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelega
             let thumb = self.session.add(photo: image, rotation: rotation, exposure: exposure)
             DispatchQueue.main.async {
                 self.photoInFlight = false
-                if let thumb { self.overlay.addPhoto(thumb, rotation: rotation) }
+                if let thumb {
+                    self.overlay.addPhoto(thumb, rotation: rotation)
+                    self.tracker?.addKeyframe(thumb, rotation: Orient.flat(rotation))
+                }
                 self.undoButton.isHidden = false
                 self.doneButton.isHidden = false
                 if let t = self.targets, t.allCaptured { self.finish() }
@@ -336,6 +374,8 @@ final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelega
     private func resetToStart() {
         unlockLens()
         targets = nil
+        tracker = nil
+        drift = matrix_identity_double3x3
         world.release()
         lockedRoll = nil
         overlay.clearDots()
@@ -347,6 +387,7 @@ final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelega
 
     @objc private func undoTapped() {
         guard !photoInFlight, session.count > 0 else { return }
+        tracker?.removeLast()
         session.removeLast()
         targets?.undo()
         overlay.removeLastPhoto()

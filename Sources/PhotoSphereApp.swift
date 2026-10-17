@@ -23,7 +23,7 @@ struct RootView: View {
     @State private var panoramas: [URL] = []
     @AppStorage("outputWidth") private var outputWidth = 6144
     @AppStorage("saveToPhotos") private var saveToPhotos = true
-    @AppStorage("nadirPatchDeg") private var nadirPatchDeg = 25.0
+    @AppStorage("nadirPatchDeg") private var nadirPatchDeg = 0.0
 
     var body: some View {
         NavigationStack {

@@ -97,6 +97,12 @@ Matx33d expSO3(const Vec3d &w) {
 }
 
 double angleOf(const Matx33d &R) { return std::acos(clamp1((cv::trace(R) - 1.0) / 2.0)); }
+/// The rotation vector of R (the inverse of expSO3).
+inline Vec3d logSO3(const Matx33d &R) {
+    double a = std::acos(clamp1((cv::trace(R) - 1.0) / 2.0));
+    if (a < 1e-9) return Vec3d(0, 0, 0);
+    return Vec3d(R(2, 1) - R(1, 2), R(0, 2) - R(2, 0), R(1, 0) - R(0, 1)) * (a / (2 * std::sin(a)));
+}
 
 Vec3d unit(const Vec3d &v) {
     double n = cv::norm(v);
@@ -296,6 +302,75 @@ bool refineDirect(const Small &a, const Small &b, Matx33d &Rji, double &before, 
     }
     return conditioned && lastStep < 1e-3 && after <= before && angleOf(Rji * R0.t()) < rad(6);
 }
+
+/// Google Camera's tracker at capture time: the live preview, small and normalised, aligned to the nearest photo already
+/// taken (the tracker maths of refineDirect), and the gyro's drift corrected by what the camera sees, so the photos
+/// pasted on the sphere stay on the scene when the camera comes back to them. The correction is a world rotation that
+/// follows the tracker slowly (the gyro is smooth, the tracker noisy): corrected = drift * gyro.
+class LiveTracker {
+public:
+    explicit LiveTracker(double shortFovRad) : hfov_(shortFovRad) {}
+    static constexpr int kShort = 120;  // the small images' short side
+
+    void addKeyframe(const Mat &gray, const Matx33d &R) {
+        Key k;
+        k.fine = make(gray, 1.0);
+        k.coarse = make(gray, 0.5);
+        k.R = R;
+        keys_.push_back(k);
+    }
+    void removeLast() {
+        if (!keys_.empty()) keys_.pop_back();
+    }
+    const Matx33d &drift() const { return drift_; }
+
+    /// A preview frame (upright, the photos' field of view) under the gyro's rotation: true when it aligned to a photo.
+    bool track(const Mat &frameGray, const Matx33d &Rgyro, int &points, double &stepDeg) {
+        points = 0;
+        stepDeg = 0;
+        if (keys_.empty()) return false;
+        Matx33d Rg = drift_ * Rgyro;  // (where the gyro says the camera is, corrected so far)
+        Vec3d f = forwardOf(Rg);
+        int best = -1;
+        double bestA = 1e9;
+        for (size_t k = 0; k < keys_.size(); k++) {
+            double a = angleBetween(f, forwardOf(keys_[k].R));
+            if (a < bestA) {
+                bestA = a;
+                best = (int)k;
+            }
+        }
+        if (best < 0 || bestA > rad(25)) return false;  // (not enough of a photo in view)
+        Small coarse = make(frameGray, 0.5), fine = make(frameGray, 1.0);
+        Matx33d Rji = keys_[best].R.t() * Rg;  // the photo's camera from the frame's
+        double before = 0, after = 0;
+        int pts = 0;
+        if (!refineDirect(coarse, keys_[best].coarse, Rji, before, after, pts)) return false;
+        if (!refineDirect(fine, keys_[best].fine, Rji, before, after, pts) || pts < 200) return false;
+        Matx33d Rvis = keys_[best].R * Rji;  // the frame by the pixels, world-from-camera
+        Matx33d step = Rvis * Rg.t();        // what the gyro is off by, in the world
+        double a = angleOf(step);
+        if (a > rad(8)) return false;  // (a wrong track)
+        drift_ = expSO3(logSO3(step) * 0.3) * drift_;
+        points = pts;
+        stepDeg = deg(a);
+        return true;
+    }
+
+private:
+    struct Key {
+        Small fine, coarse;
+        Matx33d R;
+    };
+    Small make(const Mat &gray, double rel) const {
+        int sh = std::min(gray.cols, gray.rows);
+        double f = (sh / 2.0) / std::tan(hfov_ / 2);  // (this image's focal, from the field of view)
+        return makeSmall(gray, f, rel * kShort / sh);
+    }
+    double hfov_;
+    std::vector<Key> keys_;
+    Matx33d drift_ = Matx33d::eye();
+};
 
 struct LineSeg {
     Point2d a, b;
@@ -1323,22 +1398,16 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
     result.setTo(cv::Scalar(0, 0, 0), coverage == 0);
     fillHoles(result, coverage);  // (small holes filled from their surroundings, large ones black, as GCam)
     if (nadirPatchDeg > 0 && cv::countNonZero(coverage.row(eq.H - 1)) == eq.W) {
-        // the ground right under the camera: the photographer's feet, painted over from the floor around them (a nadir
-        // patch, as 360 tools do; GCam left the feet in), with a soft upper edge
+        // the ground right under the camera (the photographer's feet) under a plain cap the colour of the floor around
+        // it, with a soft edge: a nadir patch, as 360 tools do (GCam left the feet in)
         int rows = std::min(eq.H / 2, (int)std::lround(eq.H * nadirPatchDeg / 180.0));
         if (rows > 4) {
-            Mat band = Mat::zeros(eq.H, eq.W, CV_8U);
-            band(cv::Rect(0, eq.H - rows, eq.W, rows)).setTo(255);
-            Mat small, smallMask, filled, up;
-            cv::resize(result, small, cv::Size(), 0.25, 0.25, cv::INTER_AREA);
-            cv::resize(band, smallMask, small.size(), 0, 0, cv::INTER_NEAREST);
-            cv::inpaint(small, smallMask, filled, 5, 1 /* INPAINT_TELEA */);
-            cv::GaussianBlur(filled, filled, cv::Size(0, 0), 2);
-            cv::resize(filled, up, result.size(), 0, 0, cv::INTER_LINEAR);
-            int soft = std::max(2, rows / 6);
+            cv::Scalar c = cv::mean(result.row(std::max(0, eq.H - rows - 2)));
+            Mat cap(1, eq.W, CV_8UC3, c);
+            int soft = std::max(2, rows / 5);
             for (int y = eq.H - rows; y < eq.H; y++) {
                 double a = std::min(1.0, (y - (eq.H - rows) + 1.0) / soft);
-                cv::addWeighted(up.row(y), a, result.row(y), 1 - a, 0, result.row(y));
+                cv::addWeighted(cap, a, result.row(y), 1 - a, 0, result.row(y));
             }
         }
     }

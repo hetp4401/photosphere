@@ -66,7 +66,7 @@ struct StitchView: View {
     @StateObject private var job = StitchJob()
     @AppStorage("outputWidth") private var outputWidth = 6144
     @AppStorage("saveToPhotos") private var saveToPhotos = true
-    @AppStorage("nadirPatchDeg") private var nadirPatchDeg = 25.0
+    @AppStorage("nadirPatchDeg") private var nadirPatchDeg = 0.0
     @State private var share: ShareItem?
 
     var body: some View {

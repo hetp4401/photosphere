@@ -1,4 +1,6 @@
+#import <CoreVideo/CoreVideo.h>
 #import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
 
 NS_ASSUME_NONNULL_BEGIN
 
@@ -77,6 +79,19 @@ typedef void (^PanoProgress)(double fraction, NSString *stage);
 + (NSDictionary *)selfTestMetricsForResult:(PanoStitchResult *)result
                                  truthPano:(NSString *)truthPath
                             truthRotations:(NSArray<NSArray<NSNumber *> *> *)truth;
+@end
+
+/// Google Camera's capture-time tracker: the live preview aligned to the photos taken so far, correcting the gyro's drift
+/// so the pasted photos stay on the scene. corrected = drift * gyro (world-from-camera, 9 doubles, row-major).
+@interface PanoTracker : NSObject
+- (instancetype)initWithShortFovDeg:(double)shortFovDeg;
+/// A photo just taken (upright, any size) with the rotation it was taken under (corrected).
+- (void)addKeyframe:(UIImage *)image rotation:(NSArray<NSNumber *> *)rotation;
+- (void)removeLast;
+/// A preview frame (420f/420v or BGRA, upright) under the gyro's rotation; YES when it aligned to a photo.
+- (BOOL)track:(CVPixelBufferRef)buffer gyro:(NSArray<NSNumber *> *)gyro;
+- (NSArray<NSNumber *> *)drift;
+- (double)driftDeg;
 @end
 
 NS_ASSUME_NONNULL_END
