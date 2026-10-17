@@ -255,18 +255,6 @@ bool refineDirect(const Small &a, const Small &b, Matx33d &Rji, double &before, 
     return conditioned && lastStep < 1e-3 && after <= before && angleOf(Rji * R0.t()) < rad(6);
 }
 
-struct View {
-    int w = 0, h = 0;                // at match scale
-    double scale = 1;                // match pixels per photo pixel
-    Small s16, s8, s4;               // for the direct alignment: 1/16, 1/8 and 1/4 of match scale
-    std::vector<LineSeg> lines;      // its straight edges
-    std::vector<cv::KeyPoint> kps;
-    Mat desc;
-    std::vector<Vec3d> rays;         // camera-frame unit rays of the keypoints
-    std::vector<double> lat;         // their latitude under the sensor prior
-    Matx33d Rp;                      // the sensor prior, world-from-camera
-};
-
 struct LineSeg {
     Point2d a, b;
     double len = 0;
@@ -362,6 +350,18 @@ inline void matchLines(int i, int j, const std::vector<LineSeg> &li, const std::
         out.push_back(m);
     }
 }
+
+struct View {
+    int w = 0, h = 0;                // at match scale
+    double scale = 1;                // match pixels per photo pixel
+    Small s16, s8, s4;               // for the direct alignment: 1/16, 1/8 and 1/4 of match scale
+    std::vector<LineSeg> lines;      // its straight edges
+    std::vector<cv::KeyPoint> kps;
+    Mat desc;
+    std::vector<Vec3d> rays;         // camera-frame unit rays of the keypoints
+    std::vector<double> lat;         // their latitude under the sensor prior
+    Matx33d Rp;                      // the sensor prior, world-from-camera
+};
 
 struct PairMatch {
     int i = 0, j = 0;
