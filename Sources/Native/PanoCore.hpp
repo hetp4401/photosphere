@@ -1207,8 +1207,8 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
     Mat coverage = Mat::zeros(eq.H, eq.W, CV_8U);
     report(0.6, "matching exposure");
     std::vector<Mat> smalls(n);
-    for (int i = 0; i < n; i++)
-        if (!dead[i]) cv::resize(photos[i], smalls[i], cv::Size(), views[i].scale * 0.25, views[i].scale * 0.25, cv::INTER_AREA);
+    for (int i = 0; i < n; i++)  // (a quarter of match scale; the photos are held at the compose scale)
+        if (!dead[i]) cv::resize(photos[i], smalls[i], cv::Size(), views[i].scale * 0.25 / composeScale, views[i].scale * 0.25 / composeScale, cv::INTER_AREA);
     std::vector<double> gammas;
     double maxRatio = 1;
     gammas = matchGains(smalls, R, fm * 0.25, maxRatio);
