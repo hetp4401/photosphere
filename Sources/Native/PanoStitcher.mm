@@ -427,6 +427,7 @@ NSArray<NSNumber *> *arrayFrom(const Matx33d &R) {
         return nil;
     }
     std::mt19937 rng(7);
+    try {
 
     // ---- features (GCam: FastCornerDetector + OrientedPatchExtractor; here ORB: FAST corners with oriented binary patches)
     std::vector<View> views(n);
@@ -653,8 +654,14 @@ NSArray<NSNumber *> *arrayFrom(const Matx33d &R) {
         cv::UMat img16;
         imgs[k].convertTo(img16, CV_16S);
         blender.feed(img16, m, corners[k]);
-        if (corners[k].x < pad) blender.feed(img16, m, cv::Point(corners[k].x + eq.W, corners[k].y));
-        if (corners[k].x + img16.cols > eq.W - pad) blender.feed(img16, m, cv::Point(corners[k].x - eq.W, corners[k].y));
+        if (corners[k].x < pad) {  // (its part within the margin, a turn to the right)
+            int w = std::min(img16.cols, pad - corners[k].x);
+            blender.feed(img16(cv::Rect(0, 0, w, img16.rows)), m(cv::Rect(0, 0, w, m.rows)), cv::Point(corners[k].x + eq.W, corners[k].y));
+        }
+        if (corners[k].x + img16.cols > eq.W - pad) {  // (its part within the margin, a turn to the left)
+            int c0 = std::max(0, eq.W - pad - corners[k].x);
+            blender.feed(img16(cv::Rect(c0, 0, img16.cols - c0, img16.rows)), m(cv::Rect(c0, 0, m.cols - c0, m.rows)), cv::Point(corners[k].x - eq.W + c0, corners[k].y));
+        }
         imgs[k].release();
         report(0.84 + 0.1 * (k + 1) / np, @"blending");
     }
@@ -709,6 +716,11 @@ NSArray<NSNumber *> *arrayFrom(const Matx33d &R) {
     res.rotations = rots;
     report(1.0, @"done");
     return res;
+
+    } catch (const std::exception &e) {
+        if (error) *error = err([NSString stringWithFormat:@"stitching failed: %s", e.what()]);
+        return nil;
+    }
 }
 
 // ---------------------------------------------------------------- the self test
