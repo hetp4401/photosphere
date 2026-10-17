@@ -624,7 +624,7 @@ inline void fillOutside(Mat &img, const Mat &mask) {
     Mat outside = mask == 0;
     if (cv::countNonZero(outside) == 0 || cv::countNonZero(mask) == 0) return;
     Mat dist, labels;
-    cv::distanceTransform(outside, dist, labels, cv::DIST_L2, 3, cv::DIST_LABEL_PIXEL);
+    cv::distanceTransform(outside, dist, labels, 2 /* DIST_L2 */, 3, 1 /* DIST_LABEL_PIXEL: by value, the names moved in OpenCV 5 */);
     std::vector<cv::Point> at(1);
     for (int y = 0; y < img.rows; y++) {  // (each inside pixel's label is its own: the labels' positions)
         const uchar *o = outside.ptr<uchar>(y);
@@ -904,7 +904,7 @@ inline void fillHoles(Mat &result, const Mat &coverage) {
     cv::resize(result, small, cv::Size(), 0.25, 0.25, cv::INTER_AREA);
     cv::resize(hole, smallHole, small.size(), 0, 0, cv::INTER_NEAREST);
     cv::dilate(smallHole, smallHole, Mat(), cv::Point(-1, -1), 1);
-    cv::inpaint(small, smallHole, filled, 3, cv::INPAINT_TELEA);
+    cv::inpaint(small, smallHole, filled, 3, 1 /* INPAINT_TELEA */);
     cv::resize(filled, up, result.size(), 0, 0, cv::INTER_LINEAR);
     up.copyTo(result, hole);
 }
