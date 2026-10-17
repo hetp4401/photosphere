@@ -100,7 +100,7 @@ int main(int argc, char **argv) {
                    b.rejected, b.root, bs);
             for (size_t i = 0; i < paths.size(); i++)
                 if (std::find(b.placed.begin(), b.placed.end(), (int)i) == b.placed.end()) printf(" %s", paths[i].substr(paths[i].rfind('/') + 1).c_str());
-            printf("\n");
+            printf("\nsecond chance: %s\n", b.log.c_str());
             std::vector<std::string> used;
             for (int i : b.placed) used.push_back(paths[i]);
             pano::StitchResult r = pano::stitch(used, b.R, focal, width, out, show, false);

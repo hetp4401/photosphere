@@ -39,6 +39,7 @@ struct Bootstrap {
     std::vector<int> placed;
     std::vector<Matx33d> R;
     int edges = 0, rejected = 0, secondChance = 0, root = -1;
+    std::string log;                 // what the second chance found for each photo it tried
 };
 
 struct Synth {
@@ -859,46 +860,21 @@ void applyGamma(Mat &img, double g) {
 
 /// GCam's hole treatment: what no photo covered is filled from the coarsest blend level when small (under 0.5% of the
 /// canvas), left black when large. Here: small holes take the colour of their blurred surroundings.
-void fillHoles(Mat &result, const Mat &coverage) {
-    Mat holes = coverage == 0, labels, stats, centroids;
-    int nc = cv::connectedComponentsWithStats(holes, labels, stats, centroids, 8);
-    if (nc <= 1) return;
-    double limit = 0.005 * result.cols * result.rows;
-    Mat small = Mat::zeros(holes.size(), CV_8U);
-    for (int c = 1; c < nc; c++)
-        if (stats.at<int>(c, cv::CC_STAT_AREA) < limit) small.setTo(255, labels == c);
-    if (cv::countNonZero(small) == 0) return;
-    int s = 8;
-    Mat img, msk;
-    cv::resize(result, img, cv::Size(result.cols / s, result.rows / s), 0, 0, cv::INTER_AREA);
-    cv::resize(coverage, msk, img.size(), 0, 0, cv::INTER_NEAREST);
-    img.convertTo(img, CV_32FC3);
-    Mat m;
-    msk.convertTo(m, CV_32F, 1.0 / 255);
-    for (int it = 0; it < 40; it++) {  // (the covered colours spread outward, a few pixels an iteration)
-        Mat wimg, wm;
-        std::vector<Mat> ch(3);
-        cv::split(img, ch);
-        for (auto &c : ch) {
-            cv::multiply(c, m, c);
-            cv::GaussianBlur(c, c, cv::Size(5, 5), 0);
-        }
-        cv::merge(ch, wimg);
-        cv::GaussianBlur(m, wm, cv::Size(5, 5), 0);
-        Mat fillable = (m == 0) & (wm > 1e-3);
-        if (cv::countNonZero(fillable) == 0) break;
-        std::vector<Mat> wch(3);
-        cv::split(wimg, wch);
-        for (auto &c : wch) cv::divide(c, wm, c);
-        Mat filled;
-        cv::merge(wch, filled);
-        filled.copyTo(img, fillable);
-        m.setTo(1, fillable);
-    }
-    Mat up;
-    cv::resize(img, up, result.size(), 0, 0, cv::INTER_LINEAR);
-    up.convertTo(up, CV_8UC3);
-    up.copyTo(result, small);
+/// Holes (no photo covered them) are filled by inpainting from their surroundings at a quarter of the resolution: small
+/// ones vanish, a missing ceiling corner becomes a smooth patch of ceiling. (GCam filled only holes under 0.5% of the
+/// sphere, from its coarsest level, and left the rest black; a smooth patch reads better than black.) Beyond a tenth of
+/// the sphere missing, nothing is filled: the crop takes care of a missing sky or floor.
+inline void fillHoles(Mat &result, const Mat &coverage) {
+    Mat hole = coverage == 0;
+    int holes = cv::countNonZero(hole);
+    if (holes == 0 || holes > 0.1 * hole.total()) return;
+    Mat small, smallHole, filled, up;
+    cv::resize(result, small, cv::Size(), 0.25, 0.25, cv::INTER_AREA);
+    cv::resize(hole, smallHole, small.size(), 0, 0, cv::INTER_NEAREST);
+    cv::dilate(smallHole, smallHole, Mat(), cv::Point(-1, -1), 1);
+    cv::inpaint(small, smallHole, filled, 3, cv::INPAINT_TELEA);
+    cv::resize(filled, up, result.size(), 0, 0, cv::INTER_LINEAR);
+    up.copyTo(result, hole);
 }
 
 
@@ -1485,12 +1461,13 @@ inline Bootstrap bootstrap(const std::vector<std::string> &paths, double focalPx
             }
         }
         std::vector<std::pair<Matx33d, double>> found;  // (world-from-camera, correlation at 1/4)
+        char buf[200];
         for (int a : nb) {
             double yaw0 = yawOf(R[a]), pitch0 = pitchOf(R[a]), roll0 = rollOf(R[a]);
             double bestC = -1;
             Matx33d bestRak;
-            for (int iy = -10; iy <= 10; iy++)
-                for (int ip = -7; ip <= 7; ip++) {
+            for (int iy = -15; iy <= 15; iy++)
+                for (int ip = -8; ip <= 8; ip++) {
                     double pitch = std::max(-kPi / 2, std::min(kPi / 2, pitch0 + rad(6 * ip)));
                     Matx33d Rk = lookAt(yaw0 + rad(6 * iy), pitch, roll0), Rak = R[a].t() * Rk;
                     int inside;
@@ -1500,15 +1477,22 @@ inline Bootstrap bootstrap(const std::vector<std::string> &paths, double focalPx
                         bestRak = Rak;
                     }
                 }
-            if (bestC < 0.3) continue;
+            snprintf(buf, sizeof buf, "#%d via #%d: corr %.2f", k, a, bestC);
+            out.log += buf;
+            if (bestC < 0.3) {
+                out.log += " (too low); ";
+                continue;
+            }
             Matx33d Rak = bestRak;
             double before, after;
             int pts, inside;
-            if (!refineDirect(s16[k], s16[a], Rak, before, after, pts)) continue;
-            if (!refineDirect(s8[k], s8[a], Rak, before, after, pts)) continue;
-            if (!refineDirect(s4[k], s4[a], Rak, before, after, pts)) continue;
+            int level = 0;
+            bool fine = refineDirect(s16[k], s16[a], Rak, before, after, pts) && ++level && refineDirect(s8[k], s8[a], Rak, before, after, pts) && ++level &&
+                        refineDirect(s4[k], s4[a], Rak, before, after, pts) && ++level;
             double c = correlation(s4[k], s4[a], Rak, inside);
-            if (c > 0.5) found.push_back({R[a] * Rak, c});
+            snprintf(buf, sizeof buf, ", refined %d/3 (%.0f->%.0f, %d pts), corr %.2f at 1/4; ", level, before, after, pts, c);
+            out.log += buf;
+            if (fine && c > 0.5) found.push_back({R[a] * Rak, c});
         }
         bool ok = false;
         Matx33d Rk;
@@ -1526,6 +1510,11 @@ inline Bootstrap bootstrap(const std::vector<std::string> &paths, double focalPx
             R[k] = Rk;
             placed[k] = true;
             secondChance++;
+            snprintf(buf, sizeof buf, "#%d placed (yaw %.0f pitch %.0f). ", k, deg(yawOf(Rk)), deg(pitchOf(Rk)));
+            out.log += buf;
+        } else if (!nb.empty()) {
+            snprintf(buf, sizeof buf, "#%d not placed. ", k);
+            out.log += buf;
         }
     }
     out.secondChance = secondChance;
@@ -1669,9 +1658,10 @@ inline Synth generate(const std::string &dir, const std::vector<double> &yaws, c
         cv::add(view, noise, view, cv::noArray(), CV_8UC3);
         std::string path = dir + "/" + std::to_string(v) + ".jpg";
         cv::imwrite(path, view, {cv::IMWRITE_JPEG_QUALITY, 92});
-        // the sensors' idea of it: a random error of about 1.2 degrees, and a yaw drift growing 0.25 degrees a photo
+        // the sensors' idea of it: a random error of about 0.4 degrees (a phone held still, gravity in hand), and a yaw
+        // drift growing 0.25 degrees a photo
         Vec3d axis = unit(Vec3d(N01(rng), N01(rng), N01(rng)));
-        Matx33d Rp = rotY(rad(0.25 * v)) * expSO3(axis * rad(std::fabs(N01(rng)) * 1.2)) * Rt;
+        Matx33d Rp = rotY(rad(0.25 * v)) * expSO3(axis * rad(std::fabs(N01(rng)) * 0.4)) * Rt;
         out.images.push_back(path);
         out.priors.push_back(Rp);
         out.truth.push_back(Rt);
