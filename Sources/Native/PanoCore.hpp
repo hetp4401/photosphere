@@ -188,6 +188,13 @@ Small makeSmall(const Mat &gray, double f, double scale) {
     return s;
 }
 
+
+float bilinear(const Mat &g, double x, double y) {
+    int x0 = (int)x, y0 = (int)y;
+    double fx = x - x0, fy = y - y0;
+    const float *r0 = g.ptr<float>(y0), *r1 = g.ptr<float>(y0 + 1);
+    return (float)((r0[x0] * (1 - fx) + r0[x0 + 1] * fx) * (1 - fy) + (r1[x0] * (1 - fx) + r1[x0 + 1] * fx) * fy);
+}
 /// The correlation of two photos' edges and marks (shading removed) where k, taken into a's camera by Rak, overlaps a;
 /// -1 when the overlap is too small or plain. A ceiling's smooth falloff correlates with anything; its edges do not.
 inline double correlation(const Small &k, const Small &a, const Matx33d &Rak, int &inside) {
@@ -214,13 +221,6 @@ inline double correlation(const Small &k, const Small &a, const Matx33d &Rak, in
     double vk = skk / inside - mk * mk, va = saa / inside - ma * ma;
     if (vk < 36 || va < 36) return -1.0;  // (plain: nothing to correlate)
     return (ska / inside - mk * ma) / std::sqrt(vk * va);
-}
-
-float bilinear(const Mat &g, double x, double y) {
-    int x0 = (int)x, y0 = (int)y;
-    double fx = x - x0, fy = y - y0;
-    const float *r0 = g.ptr<float>(y0), *r1 = g.ptr<float>(y0 + 1);
-    return (float)((r0[x0] * (1 - fx) + r0[x0 + 1] * fx) * (1 - fy) + (r1[x0] * (1 - fx) + r1[x0 + 1] * fx) * fy);
 }
 
 /// Refines the rotation taking camera a's rays to camera b's directly on the pixels (GCam's CameraRotationModel /
