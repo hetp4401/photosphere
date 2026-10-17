@@ -9,6 +9,7 @@
 #include <cmath>
 #include <functional>
 #include <map>
+#include <mutex>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -312,22 +313,28 @@ public:
     explicit LiveTracker(double shortFovRad) : hfov_(shortFovRad) {}
     static constexpr int kShort = 120;  // the small images' short side
 
-    void addKeyframe(const Mat &gray, const Matx33d &R) {
+    void addKeyframe(const Mat &gray, const Matx33d &R) {  // (photos arrive on one thread, frames on another)
         Key k;
         k.fine = make(gray, 1.0);
         k.coarse = make(gray, 0.5);
         k.R = R;
+        std::lock_guard<std::mutex> lock(mutex_);
         keys_.push_back(k);
     }
     void removeLast() {
+        std::lock_guard<std::mutex> lock(mutex_);
         if (!keys_.empty()) keys_.pop_back();
     }
-    const Matx33d &drift() const { return drift_; }
+    Matx33d drift() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return drift_;
+    }
 
     /// A preview frame (upright, the photos' field of view) under the gyro's rotation: true when it aligned to a photo.
     bool track(const Mat &frameGray, const Matx33d &Rgyro, int &points, double &stepDeg) {
         points = 0;
         stepDeg = 0;
+        std::lock_guard<std::mutex> lock(mutex_);
         if (keys_.empty()) return false;
         Matx33d Rg = drift_ * Rgyro;  // (where the gyro says the camera is, corrected so far)
         Vec3d f = forwardOf(Rg);
@@ -368,6 +375,7 @@ private:
         return makeSmall(gray, f, rel * kShort / sh);
     }
     double hfov_;
+    mutable std::mutex mutex_;
     std::vector<Key> keys_;
     Matx33d drift_ = Matx33d::eye();
 };
