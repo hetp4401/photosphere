@@ -60,7 +60,7 @@ final class SelfTestModel: ObservableObject {
                 }
                 do {
                     let raw = (wdir as NSString).appendingPathComponent("result.jpg")
-                    let res = try PanoStitcher.stitchImages(paths, rotations: priors, focalPx: focal, outputWidth: 4096, outputPath: raw, priorsFromSensors: true, nadirPatchDeg: 0) { f, s in
+                    let res = try PanoStitcher.stitchImages(paths, rotations: priors, focalPx: focal, outputMegapixels: 8.4, outputPath: raw, priorsFromSensors: true, nadirPatchDeg: 0) { f, s in
                         Task { @MainActor in self.status = String(format: "%@: %@ %.0f%%", world, s, f * 100) }
                     }
                     let metrics = PanoStitcher.selfTestMetrics(for: res, truthPano: truthPano, truthRotations: truth)
@@ -71,7 +71,7 @@ final class SelfTestModel: ObservableObject {
                                       world, res.imagesUsed, res.pairsMatched, rms, worst, psnr, res.cropWidth, res.cropHeight, res.fullWidth, res.fullHeight,
                                       res.fullCircle ? 1 : 0, res.seconds, pass ? "PASS" : "FAIL")
                     let packet = XMP.gpanoPacket(fullWidth: Int(res.fullWidth), fullHeight: Int(res.fullHeight), cropWidth: Int(res.cropWidth), cropHeight: Int(res.cropHeight),
-                                                 left: Int(res.cropLeft), top: Int(res.cropTop), headingDeg: 0, firstDate: Date(), lastDate: Date(), sourceCount: paths.count, usePanoramaViewer: true)
+                                                 left: Int(res.cropLeft), top: Int(res.cropTop), headingDeg: nil, firstDate: Date(), lastDate: Date(), sourceCount: paths.count, usePanoramaViewer: true)
                     let data = XMP.embed(packet: packet, in: try Data(contentsOf: URL(fileURLWithPath: raw)))
                     let out = CaptureSession.panoramasDir.appendingPathComponent("selftest-\(world).jpg")
                     try data.write(to: out, options: .atomic)

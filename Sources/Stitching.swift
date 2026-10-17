@@ -1,4 +1,5 @@
 import Foundation
+import os
 import Photos
 import SwiftUI
 import UIKit
@@ -13,7 +14,9 @@ final class StitchJob: ObservableObject {
     @Published var summary = ""
     @Published var failure: String?
 
-    func run(session: CaptureSession, outputWidth: Int, saveToPhotos: Bool, nadirPatchDeg: Double) {
+    /// outputMegapixels: Google Camera's quality: 8 (low), 26 (high, its default) or 70 (max), capped by the memory this
+    /// app may still use (GCam: (heap MB - 30) / 6.5 MP; here about 28 bytes a pixel while blending).
+    func run(session: CaptureSession, outputMegapixels: Double, saveToPhotos: Bool, nadirPatchDeg: Double) {
         let info = session.info
         let dir = session.dir
         Task.detached(priority: .userInitiated) {
@@ -24,7 +27,9 @@ final class StitchJob: ObservableObject {
                 let longFov = max(info.hfovDeg, info.vfovDeg) * .pi / 180
                 let focalPx = info.focalPx > 0 ? info.focalPx : (longSide / 2) / tan(longFov / 2)
                 let raw = FileManager.default.temporaryDirectory.appendingPathComponent("pano_raw.jpg")
-                let res = try PanoStitcher.stitchImages(paths, rotations: rotations, focalPx: focalPx, outputWidth: Int32(outputWidth), outputPath: raw.path, priorsFromSensors: true, nadirPatchDeg: nadirPatchDeg) { f, s in
+                let avail = Double(os_proc_available_memory())
+                let mp = avail > 0 ? min(outputMegapixels, max(8, (avail - 400e6) / 28 / 1e6)) : outputMegapixels
+                let res = try PanoStitcher.stitchImages(paths, rotations: rotations, focalPx: focalPx, outputMegapixels: mp, outputPath: raw.path, priorsFromSensors: true, nadirPatchDeg: nadirPatchDeg) { f, s in
                     Task { @MainActor in
                         self.fraction = f
                         self.stage = s
@@ -35,7 +40,8 @@ final class StitchJob: ObservableObject {
                 let realFov = Double(res.cropWidth) / Double(res.fullWidth) * 360
                 let packet = XMP.gpanoPacket(fullWidth: Int(res.fullWidth), fullHeight: Int(res.fullHeight), cropWidth: Int(res.cropWidth),
                                              cropHeight: Int(res.cropHeight), left: Int(res.cropLeft), top: Int(res.cropTop),
-                                             headingDeg: info.headingDeg ?? 0, firstDate: first, lastDate: last, sourceCount: info.shots.count,
+                                             headingDeg: info.headingDeg.map { ($0 - res.firstYawDeg + 720).truncatingRemainder(dividingBy: 360) },
+                                             firstDate: first, lastDate: last, sourceCount: info.shots.count,
                                              usePanoramaViewer: realFov >= 70)
                 let data = XMP.embed(packet: packet, in: try Data(contentsOf: raw))
                 let out = CaptureSession.panoramasDir.appendingPathComponent("\(CaptureSession.stamp(first)).jpg")
@@ -47,7 +53,7 @@ final class StitchJob: ObservableObject {
                         try? await PHPhotoLibrary.shared().performChanges { _ = PHAssetChangeRequest.creationRequestForAssetFromImage(atFileURL: out) }
                     }
                 }
-                let text = "\(res.imagesUsed) photos, \(res.pairsMatched) matched pairs, \(res.cropWidth)x\(res.cropHeight) of \(res.fullWidth)x\(res.fullHeight), "
+                let text = "\(res.imagesUsed) photos, \(res.pairsMatched) matched pairs, \(res.cropWidth)x\(res.cropHeight) (" + String(format: "%.0f MP, %.0f px/deg", Double(res.cropWidth * res.cropHeight) / 1e6, Double(res.fullWidth) / 360) + "), "
                     + String(format: "%.0f s", res.seconds) + (res.fullCircle ? ", full circle" : "")
                 await MainActor.run {
                     self.summary = text
@@ -64,7 +70,7 @@ struct StitchView: View {
     let session: CaptureSession
     let onDone: (URL?) -> Void
     @StateObject private var job = StitchJob()
-    @AppStorage("outputWidth") private var outputWidth = 6144
+    @AppStorage("outputMegapixels") private var outputMegapixels = 26.0
     @AppStorage("saveToPhotos") private var saveToPhotos = true
     @AppStorage("nadirPatchDeg") private var nadirPatchDeg = 0.0
     @State private var share: ShareItem?
@@ -94,7 +100,7 @@ struct StitchView: View {
             }
         }
         .padding(.vertical)
-        .onAppear { job.run(session: session, outputWidth: outputWidth, saveToPhotos: saveToPhotos, nadirPatchDeg: nadirPatchDeg) }
+        .onAppear { job.run(session: session, outputMegapixels: outputMegapixels, saveToPhotos: saveToPhotos, nadirPatchDeg: nadirPatchDeg) }
     }
 }
 

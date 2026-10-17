@@ -87,7 +87,7 @@ jobs:
           mkdir -p "$CONT/tmp/room"
           cp room/*.jpg "$CONT/tmp/room/"
           xcrun simctl terminate "$DEV" "$BUNDLE" 2>/dev/null || true
-          xcrun simctl launch "$DEV" "$BUNDLE" -stitchdir room -focalPx 1470 -out room -width 4096
+          xcrun simctl launch "$DEV" "$BUNDLE" -stitchdir room -focalPx 1470 -out room -megapixels 26
           for k in $(seq 1 240); do [ -f "$CONT/Documents/room.txt" ] && break; sleep 5; done
           if [ ! -f "$CONT/Documents/room.txt" ]; then echo "no result in time"; xcrun simctl io "$DEV" screenshot private/room-timeout.png; exit 0; fi
           cat "$CONT/Documents/room.txt" | tee private/room.txt; echo

@@ -5,10 +5,10 @@ import Foundation
 /// viewers that look for it show the file as a sphere.
 enum XMP {
     static func gpanoPacket(fullWidth: Int, fullHeight: Int, cropWidth: Int, cropHeight: Int, left: Int, top: Int,
-                            headingDeg: Double, firstDate: Date, lastDate: Date, sourceCount: Int, usePanoramaViewer: Bool) -> String {
+                            headingDeg: Double?, firstDate: Date, lastDate: Date, sourceCount: Int, usePanoramaViewer: Bool) -> String {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let fields: [(String, String)] = [
+        var fields: [(String, String)] = [
             ("ProjectionType", "equirectangular"),
             ("UsePanoramaViewer", usePanoramaViewer ? "True" : "False"),
             ("CroppedAreaImageWidthPixels", "\(cropWidth)"),
@@ -17,18 +17,42 @@ enum XMP {
             ("FullPanoHeightPixels", "\(fullHeight)"),
             ("CroppedAreaLeftPixels", "\(left)"),
             ("CroppedAreaTopPixels", "\(top)"),
-            ("PoseHeadingDegrees", String(format: "%.1f", headingDeg)),
             ("FirstPhotoDate", f.string(from: firstDate)),
             ("LastPhotoDate", f.string(from: lastDate)),
             ("SourcePhotosCount", "\(sourceCount)"),
             ("CaptureSoftware", "PhotoSphere for iPhone"),
             ("StitchingSoftware", "PhotoSphere for iPhone"),
+            ("LargestValidInteriorRectLeft", "0"),
+            ("LargestValidInteriorRectTop", "0"),
+            ("LargestValidInteriorRectWidth", "\(cropWidth)"),
+            ("LargestValidInteriorRectHeight", "\(cropHeight)"),
         ]
+        if let h = headingDeg { fields.append(("PoseHeadingDegrees", String(format: "%.1f", h))) }  // (GCam: only when known)
         let attrs = fields.map { " GPano:\($0.0)=\"\($0.1)\"" }.joined()
         return "<?xpacket begin=\"\u{FEFF}\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>"
             + "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">"
             + "<rdf:Description rdf:about=\"\" xmlns:GPano=\"http://ns.google.com/photos/1.0/panorama/\"\(attrs)/>"
             + "</rdf:RDF></x:xmpmeta><?xpacket end=\"w\"?>"
+    }
+
+    /// The crop a file's GPano metadata gives: (full width, full height, crop width, crop height, crop left, crop top).
+    static func gpanoCrop(of url: URL) -> (Double, Double, Double, Double, Double, Double)? {
+        guard let h = FileHandle(forReadingAtPath: url.path) else { return nil }
+        defer { try? h.close() }
+        let head = String(decoding: h.readData(ofLength: 256 * 1024), as: UTF8.self)
+        func value(_ k: String) -> Double? {
+            for pattern in ["GPano:\(k)=\"", "<GPano:\(k)>"] {
+                if let r = head.range(of: pattern) {
+                    let rest = head[r.upperBound...]
+                    let num = rest.prefix { "0123456789.-".contains($0) }
+                    if let v = Double(num) { return v }
+                }
+            }
+            return nil
+        }
+        guard let fw = value("FullPanoWidthPixels"), let fh = value("FullPanoHeightPixels"), let cw = value("CroppedAreaImageWidthPixels"),
+              let ch = value("CroppedAreaImageHeightPixels"), fw > 0, fh > 0, cw > 0, ch > 0 else { return nil }
+        return (fw, fh, cw, ch, value("CroppedAreaLeftPixels") ?? 0, value("CroppedAreaTopPixels") ?? 0)
     }
 
     /// The JPEG with an XMP APP1 segment inserted after SOI (an existing one is left alone: ours comes first).

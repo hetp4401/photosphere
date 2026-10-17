@@ -116,14 +116,14 @@ static cv::Mat grayFrom(UIImage *image) {
 + (nullable PanoStitchResult *)stitchImages:(NSArray<NSString *> *)paths
                                   rotations:(NSArray<NSArray<NSNumber *> *> *)rotations
                                     focalPx:(double)focalPx
-                                outputWidth:(int)outputWidth
+                           outputMegapixels:(double)outputMegapixels
                                  outputPath:(NSString *)outputPath
                           priorsFromSensors:(BOOL)priorsFromSensors
                               nadirPatchDeg:(double)nadirPatchDeg
                                    progress:(nullable PanoProgress)progress
                                       error:(NSError **)error {
     try {
-        pano::StitchResult r = pano::stitch(strings(paths), matricesFrom(rotations), focalPx, outputWidth, outputPath.UTF8String, progressFrom(progress), priorsFromSensors,
+        pano::StitchResult r = pano::stitch(strings(paths), matricesFrom(rotations), focalPx, outputMegapixels, outputPath.UTF8String, progressFrom(progress), priorsFromSensors,
                                             nadirPatchDeg);
         PanoStitchResult *res = [PanoStitchResult new];
         res.path = [NSString stringWithUTF8String:r.path.c_str()];
@@ -144,6 +144,7 @@ static cv::Mat grayFrom(UIImage *image) {
         NSMutableArray *dropped = [NSMutableArray array];
         for (int i : r.dropped) [dropped addObject:@(i)];
         res.dropped = dropped;
+        res.firstYawDeg = r.firstYawDeg;
         return res;
     } catch (const std::exception &e) {
         if (error) *error = err(std::string("stitching failed: ") + e.what());

@@ -34,6 +34,7 @@ struct StitchResult {
     std::vector<int> dropped;        // photos not rendered: nothing held them (photos without a gyro only)
     std::string notes;
     std::string pairReport;          // one line per pair after the adjustment: i j kind inliers median_px
+    double firstYawDeg = 0;          // where the first photo ended up: its longitude in the output (degrees, + = right)
 };
 
 struct Bootstrap {
@@ -727,11 +728,13 @@ inline void fillOutside(Mat &img, const Mat &mask) {
     }
 }
 
-/// Warps one photo onto the equirect canvas: its bounding box from its border (a pole inside it: the whole width), an
-/// inverse map over that box (each canvas pixel to a photo pixel), the photo sampled bilinearly, and the result cut into
-/// pieces inside the canvas when it crosses the +-180 edge.
-void warpPhoto(const Mat &img, double f, double cx, double cy, const Matx33d &R, const Equirect &eq, int src, std::vector<Piece> &out) {
-    int w = img.cols, h = img.rows;
+/// Where a photo lands on the equirect canvas: columns [x0, x1] (past either edge when it crosses the +-180 line) and
+/// rows [y0, y1], from its border; a pole inside it takes the whole width.
+struct Box {
+    int x0 = 0, x1 = -1, y0 = 0, y1 = -1;
+};
+
+inline Box photoBox(int w, int h, double f, double cx, double cy, const Matx33d &R, const Equirect &eq) {
     Matx33d Rt = R.t();
     std::vector<double> us, vs;
     const int N = 64;
@@ -778,6 +781,96 @@ void warpPhoto(const Mat &img, double f, double cx, double cy, const Matx33d &R,
         x0 = 0;
         x1 = eq.W - 1;
     }
+    Box b;
+    b.x0 = x0;
+    b.x1 = x1;
+    b.y0 = y0;
+    b.y1 = y1;
+    return b;
+}
+
+/// The canvas pixels a photo covers set to 255 in cov (eq.H x eq.W, 8U).
+inline void markCoverage(int w, int h, double f, double cx, double cy, const Matx33d &R, const Equirect &eq, Mat &cov) {
+    Box b = photoBox(w, h, f, cx, cy, R, eq);
+    Matx33d Rt = R.t();
+    std::vector<double> sl(eq.W), cl(eq.W);
+    for (int x = 0; x < eq.W; x++) {
+        double lam = (x + 0.5) / eq.W * 2 * kPi - kPi;
+        sl[x] = std::sin(lam);
+        cl[x] = std::cos(lam);
+    }
+    for (int y = b.y0; y <= b.y1; y++) {
+        double phi = kPi / 2 - (y + 0.5) / eq.H * kPi, sp = std::sin(phi), cp = std::cos(phi);
+        uchar *row = cov.ptr<uchar>(y);
+        for (int x = b.x0; x <= b.x1; x++) {
+            int xx = ((x % eq.W) + eq.W) % eq.W;
+            double dx = cp * sl[xx], dy = -sp, dz = cp * cl[xx];
+            double cz = Rt(2, 0) * dx + Rt(2, 1) * dy + Rt(2, 2) * dz;
+            if (cz <= 1e-6) continue;
+            double px = f * (Rt(0, 0) * dx + Rt(0, 1) * dy + Rt(0, 2) * dz) / cz + cx;
+            double py = f * (Rt(1, 0) * dx + Rt(1, 1) * dy + Rt(1, 2) * dz) / cz + cy;
+            if (px >= 0 && px <= w - 1 && py >= 0 && py <= h - 1) row[xx] = 255;
+        }
+    }
+}
+
+/// The largest axis-aligned rectangle of nonzero pixels (GCam: FindLargestInteriorRect), by the histogram method.
+inline cv::Rect largestInteriorRect(const Mat &bin) {
+    std::vector<int> hgt(bin.cols, 0), st;
+    long best = 0;
+    cv::Rect r(0, 0, 0, 0);
+    for (int y = 0; y < bin.rows; y++) {
+        const uchar *p = bin.ptr<uchar>(y);
+        for (int x = 0; x < bin.cols; x++) hgt[x] = p[x] ? hgt[x] + 1 : 0;
+        st.clear();
+        for (int x = 0; x <= bin.cols; x++) {
+            int hc = x < bin.cols ? hgt[x] : 0;
+            while (!st.empty() && hgt[st.back()] >= hc) {
+                int hh = hgt[st.back()];
+                st.pop_back();
+                int left = st.empty() ? 0 : st.back() + 1;
+                long area = (long)hh * (x - left);
+                if (area > best) {
+                    best = area;
+                    r = cv::Rect(left, y - hh + 1, x - left, hh);
+                }
+            }
+            if (x < bin.cols) st.push_back(x);
+        }
+    }
+    return r;
+}
+
+/// The pieces cut to a rectangle of the canvas (those outside it dropped).
+inline void clipPieces(std::vector<Piece> &ps, const cv::Rect &r) {
+    std::vector<Piece> out;
+    for (auto &p : ps) {
+        cv::Rect pr(p.tl, p.mask.size()), c = pr & r;
+        if (c.area() <= 0) continue;
+        if (c == pr) {
+            out.push_back(p);
+            continue;
+        }
+        Piece q;
+        cv::Rect local(c.tl() - p.tl, c.size());
+        q.img = p.img(local).clone();
+        q.mask = p.mask(local).clone();
+        q.tl = c.tl();
+        q.src = p.src;
+        if (cv::countNonZero(q.mask) > 0) out.push_back(q);
+    }
+    ps.swap(out);
+}
+
+/// Warps one photo onto the equirect canvas: its bounding box from its border (a pole inside it: the whole width), an
+/// inverse map over that box (each canvas pixel to a photo pixel), the photo sampled bilinearly, and the result cut into
+/// pieces inside the canvas when it crosses the +-180 edge. Only rows rowLo..rowHi are made (rowHi < 0: to the bottom).
+void warpPhoto(const Mat &img, double f, double cx, double cy, const Matx33d &R, const Equirect &eq, int src, std::vector<Piece> &out,
+               int rowLo = 0, int rowHi = -1) {
+    int w = img.cols, h = img.rows;
+    Matx33d Rt = R.t();
+    Box box = photoBox(w, h, f, cx, cy, R, eq);
+    int x0 = box.x0, x1 = box.x1, y0 = std::max(box.y0, rowLo), y1 = std::min(box.y1, rowHi < 0 ? eq.H - 1 : rowHi);
     int bw = x1 - x0 + 1, bh = y1 - y0 + 1;
     if (bw <= 0 || bh <= 0) return;
     std::vector<double> sl(bw), cl(bw), sp(bh), cp(bh);
@@ -1001,8 +1094,10 @@ inline void fillHoles(Mat &result, const Mat &coverage) {
 /// so they get no sensor pairs or geometry checks, a weaker gravity prior, and a photo nothing holds is dropped.
 /// nadirPatchDeg: when > 0 and the sphere is complete, that many degrees of the ground right under the camera (the
 /// photographer's own feet) are painted over from the floor around them.
+/// outputMegapixels: GCam's pixel budget (8, 26 or 70 MP: its low, high and max qualities), spent on what the photos
+/// cover; the output never holds more pixels per degree than the photos do.
 inline StitchResult stitch(const std::vector<std::string> &paths, const std::vector<Matx33d> &rotations, double focalPx,
-                           int outputWidth, const std::string &outputPath, const Progress &progress, bool sensors = true,
+                           double outputMegapixels, const std::string &outputPath, const Progress &progress, bool sensors = true,
                            double nadirPatchDeg = 0) {
     auto report = [&](double frac, const char *stage) {
         if (progress) progress(frac, stage);
@@ -1014,12 +1109,10 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
 
     // ---- features (GCam: FastCornerDetector + OrientedPatchExtractor; here ORB: FAST corners with oriented binary patches)
     std::vector<View> views(n);
-    std::vector<Mat> photos(n);
     cv::Ptr<cv::ORB> orb = cv::ORB::create(4000, 1.2f, 8, 31, 0, 2, cv::ORB::HARRIS_SCORE, 31, 10);  // (a low FAST threshold: plain walls)
     double matchScale = 1, fm = focalPx;
-    // (the photos are kept no larger than the render needs: 1.3x the output's resolution; a phone's memory is finite)
-    Equirect eq(outputWidth);
-    double composeScale = std::min(1.0, 1.3 * (eq.W / (2 * kPi)) / focalPx);
+    std::vector<cv::Size> fullSize(n);
+    std::vector<Mat> mids(n);  // (each photo at half the match scale, for the seams and the exposure; the render reads the files again)
     for (int i = 0; i < n; i++) {
         Mat img = cv::imread(paths[i], cv::IMREAD_COLOR);
         if (img.empty()) throw std::runtime_error("can't read " + paths[i]);
@@ -1027,14 +1120,14 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
             matchScale = std::min(1.0, (double)kMatchWidth / std::max(img.cols, img.rows));
             fm = focalPx * matchScale;
         }
-        if (composeScale < 0.999) cv::resize(img, photos[i], cv::Size(), composeScale, composeScale, cv::INTER_AREA);
-        else photos[i] = img;
+        fullSize[i] = img.size();
         View &v = views[i];
         // (every photo's long side goes to the match width: one camera, so one match-scale focal, whichever way it was held)
         v.scale = std::min(1.0, (double)kMatchWidth / std::max(img.cols, img.rows));
         v.Rp = rotations[i];
         Mat small, gray;
         cv::resize(img, small, cv::Size(), v.scale, v.scale, cv::INTER_AREA);
+        cv::resize(small, mids[i], cv::Size(), 0.5, 0.5, cv::INTER_AREA);
         cv::cvtColor(small, gray, cv::COLOR_BGR2GRAY);
         v.w = gray.cols;
         v.h = gray.rows;
@@ -1317,139 +1410,299 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
         pairReport += line;
     }
 
-    // ---- render: each photo warped onto the canvas, exposure matched, seams cut, blended in bands
-    std::vector<Piece> pieces;
-    Mat coverage = Mat::zeros(eq.H, eq.W, CV_8U);
+    // ---- the output's size and extent, GCam's way (PhotosphereRenderQueueOptions, ComputeOutputSizePixels,
+    // Stitcher::RenderMosaic): a pixel budget spent on what the photos cover, measured on a 2400x1200 probe; never more
+    // pixels per degree than the photos hold (no photo enlarged); a full circle keeps its whole width (a multiple of the
+    // blend distance) and loses only the rows it doesn't fill (10 deg at most each end, counted from where the photos
+    // start); a partial capture is cut to the largest rectangle the photos fill. Only that rectangle is rendered.
+    report(0.58, "sizing");
+    std::vector<int> live;
+    for (int i = 0; i < n; i++)
+        if (!dead[i]) live.push_back(i);
+    if (live.empty()) throw std::runtime_error("nothing to render");
+    auto focalOf = [&](int i) { return fAdj / views[i].scale; };  // (photo i's focal at its full size)
+    Equirect probe(2400);
+    auto coverProbe = [&]() {
+        Mat c = Mat::zeros(probe.H, probe.W, CV_8U);
+        for (int i : live)
+            markCoverage(fullSize[i].width, fullSize[i].height, focalOf(i), (fullSize[i].width - 1) / 2.0, (fullSize[i].height - 1) / 2.0, R[i], probe, c);
+        return c;
+    };
+    Mat cov = coverProbe(), colAny;
+    cv::reduce(cov, colAny, 0, cv::REDUCE_MAX);
+    bool full = cv::countNonZero(colAny) == probe.W;
+    // the heading: a full circle has its first photo in the middle (GCam); a partial one is centred on what it covers,
+    // so it never straddles the +-180 line
+    double shift = 0;
+    if (full) {
+        Vec3d d = forwardOf(R[live[0]]);
+        shift = -std::atan2(d[0], d[2]);
+    } else {
+        int Wp = probe.W, start = 0, bestLen = 0, bestStart = 0, run = 0, runStart = 0;
+        while (start < Wp && !colAny.at<uchar>(start)) start++;
+        if (start == Wp) throw std::runtime_error("nothing covered");
+        for (int k = 1; k <= Wp; k++) {
+            int x = (start + k) % Wp;
+            if (colAny.at<uchar>(x)) {
+                run = 0;
+                continue;
+            }
+            if (run++ == 0) runStart = x;
+            if (run > bestLen) {
+                bestLen = run;
+                bestStart = runStart;
+            }
+        }
+        double mid = std::fmod(bestStart + bestLen / 2.0, (double)Wp);
+        shift = kPi - (mid / Wp * 2 * kPi - kPi);
+    }
+    Matx33d Ry(std::cos(shift), 0, std::sin(shift), 0, 1, 0, -std::sin(shift), 0, std::cos(shift));
+    for (auto &Ri : R) Ri = Ry * Ri;
+    cov = coverProbe();
+    {  // (islands under 0.5% of the sphere don't count: GCam's CreateRunLengthMinAreaMasker)
+        Mat labels, stats, cents;
+        int nl = cv::connectedComponentsWithStats(cov, labels, stats, cents, 8, CV_32S);
+        for (int l = 1; l < nl; l++)
+            if (stats.at<int>(l, cv::CC_STAT_AREA) < 0.005 * probe.W * probe.H) cov.setTo(0, labels == l);
+    }
+    cv::Rect pb;
+    if (full) {
+        Mat rowAny, rowAll;
+        cv::reduce(cov, rowAny, 1, cv::REDUCE_MAX);
+        cv::reduce(cov, rowAll, 1, cv::REDUCE_MIN);
+        int first = 0, last = probe.H - 1, lim = probe.H / 18;
+        while (first < probe.H - 1 && !rowAny.at<uchar>(first)) first++;
+        while (last > first && !rowAny.at<uchar>(last)) last--;
+        int top = first, bottom = last;
+        while (top < first + lim && !rowAll.at<uchar>(top)) top++;
+        while (bottom > last - lim && !rowAll.at<uchar>(bottom)) bottom--;
+        pb = cv::Rect(0, top, probe.W, std::max(1, bottom - top + 1));
+    } else {
+        Mat inner;
+        cv::erode(cov, inner, Mat());  // (a probe pixel in from the edge: the rectangle stays inside the photos at full size)
+        pb = largestInteriorRect(inner);
+        if (pb.area() < 16) pb = largestInteriorRect(cov);
+        if (pb.area() < 1) throw std::runtime_error("nothing covered");
+    }
+    double budget = std::max(1.0, outputMegapixels) * 1e6;
+    int W = 2 * (int)std::lround(probe.W * std::sqrt(budget / (double)pb.area()) / 2.0);
+    double minMag = 1e9;  // (canvas pixels per photo pixel at the photos' centres: the smallest, when above 1, shrinks the canvas)
+    {
+        Equirect e(W);
+        for (int i : live) {
+            double f = focalOf(i), cx = (fullSize[i].width - 1) / 2.0, cy = (fullSize[i].height - 1) / 2.0;
+            Point2d p0 = e.pixel(R[i] * rayOf(cx, cy, f, cx, cy)), p1 = e.pixel(R[i] * rayOf(cx + 1, cy, f, cx, cy));
+            double dx = p1.x - p0.x;
+            if (dx > W / 2.0) dx -= W;
+            if (dx < -W / 2.0) dx += W;
+            minMag = std::min(minMag, std::hypot(dx, p1.y - p0.y));
+        }
+    }
+    if (minMag > 1) W = 2 * (int)std::floor(W / minMag / 2.0);
+    if (full) W -= W % 512;  // (a multiple of the blend distance, 2^(levels-1): the wrap blends like the rest)
+    W = std::max(W, 1024);
+    Equirect eq(W);
+    double toW = (double)W / probe.W;
+    cv::Rect bounds;
+    if (full) {
+        int y0 = (int)std::ceil(pb.y * toW), y1 = std::min(eq.H, (int)std::floor((pb.y + pb.height) * toW));
+        bounds = cv::Rect(0, y0, W, std::max(1, y1 - y0));
+    } else {
+        int x0 = (int)std::ceil(pb.x * toW), y0 = (int)std::ceil(pb.y * toW);
+        int x1 = (int)std::floor((pb.x + pb.width) * toW), y1 = (int)std::floor((pb.y + pb.height) * toW);
+        bounds = cv::Rect(x0, y0, std::max(1, x1 - x0), std::max(1, y1 - y0)) & cv::Rect(0, 0, eq.W, eq.H);
+    }
+
+    // ---- exposure: one gain per photo from the overlaps
     report(0.6, "matching exposure");
-    std::vector<Mat> smalls(n);
-    for (int i = 0; i < n; i++)  // (a quarter of match scale; the photos are held at the compose scale)
-        if (!dead[i]) cv::resize(photos[i], smalls[i], cv::Size(), views[i].scale * 0.25 / composeScale, views[i].scale * 0.25 / composeScale, cv::INTER_AREA);
     std::vector<double> gammas;
     double maxRatio = 1;
-    gammas = matchGains(smalls, R, fm * 0.25, maxRatio);
-    smalls.clear();
-    for (int i = 0; i < n; i++) {
-        if (dead[i]) {
-            photos[i].release();
-            continue;
+    {
+        std::vector<Mat> smalls(n);
+        for (int i : live) cv::resize(mids[i], smalls[i], cv::Size(), 0.5, 0.5, cv::INTER_AREA);
+        gammas = matchGains(smalls, R, fAdj * 0.25, maxRatio);
+    }
+
+    // ---- seams (GCam: graph cuts on a 512-wide mosaic): cut on about half a megapixel of the rendered rectangle
+    report(0.64, "finding seams");
+    double ss = std::min(1.0, std::sqrt(0.5e6 / (double)bounds.area()));
+    int Ws = std::max(64, 2 * (int)std::lround(W * ss / 2.0));
+    ss = (double)Ws / W;
+    Equirect eqS(Ws);
+    cv::Rect bS((int)std::floor(bounds.x * ss), (int)std::floor(bounds.y * ss), 1, 1);
+    bS.width = std::max(1, std::min(eqS.W, (int)std::ceil((bounds.x + bounds.width) * ss)) - bS.x);
+    bS.height = std::max(1, std::min(eqS.H, (int)std::ceil((bounds.y + bounds.height) * ss)) - bS.y);
+    std::vector<Mat> seamOf(n);
+    {
+        std::vector<Piece> sp;
+        for (int i : live) {
+            Mat m = mids[i].clone();
+            applyGain(m, gammas[i]);
+            double f = fAdj * m.cols / (double)views[i].w;
+            warpPhoto(m, f, (m.cols - 1) / 2.0, (m.rows - 1) / 2.0, R[i], eqS, i, sp, bS.y, bS.y + bS.height - 1);
         }
-        Mat src = photos[i];
-        applyGain(src, gammas[i]);
-        double f = fAdj / views[i].scale * composeScale, cx = (src.cols - 1) / 2.0, cy = (src.rows - 1) / 2.0;
-        size_t before = pieces.size();
-        warpPhoto(src, f, cx, cy, R[i], eq, i, pieces);
-        for (size_t k = before; k < pieces.size(); k++) {
-            Mat roi = coverage(cv::Rect(pieces[k].tl, pieces[k].mask.size()));
-            cv::bitwise_or(roi, pieces[k].mask, roi);
+        clipPieces(sp, bS);
+        if (sp.empty()) throw std::runtime_error("nothing to render");
+        std::vector<cv::UMat> si(sp.size()), sm(sp.size());
+        std::vector<cv::Point> sc(sp.size());
+        for (size_t k = 0; k < sp.size(); k++) {
+            sp[k].img.convertTo(si[k], CV_32F);
+            sp[k].mask.copyTo(sm[k]);
+            sc[k] = sp[k].tl;
         }
-        photos[i].release();
-        report(0.6 + 0.12 * (i + 1) / n, "warping");
-    }
-    if (pieces.empty()) throw std::runtime_error("nothing to render");
-    int np = (int)pieces.size();
-    std::vector<cv::Point> corners(np);
-    std::vector<cv::UMat> imgs(np), masks(np);
-    for (int k = 0; k < np; k++) {
-        corners[k] = pieces[k].tl;
-        pieces[k].img.copyTo(imgs[k]);
-        pieces[k].mask.copyTo(masks[k]);
-    }
-    report(0.76, "finding seams");
-    double seamScale = std::min(1.0, 1024.0 / eq.W);  // (GCam cut its seams on a 512-wide mosaic)
-    std::vector<cv::UMat> seamImgs(np), seamMasks(np);
-    std::vector<cv::Point> seamCorners(np);
-    for (int k = 0; k < np; k++) {
-        cv::UMat s;
-        cv::resize(imgs[k], s, cv::Size(), seamScale, seamScale, cv::INTER_AREA);
-        s.convertTo(seamImgs[k], CV_32F);
-        cv::resize(masks[k], seamMasks[k], s.size(), 0, 0, cv::INTER_NEAREST);
-        seamCorners[k] = cv::Point((int)std::lround(corners[k].x * seamScale), (int)std::lround(corners[k].y * seamScale));
-    }
-    try {
-        cv::detail::GraphCutSeamFinder seam(cv::detail::GraphCutSeamFinderBase::COST_COLOR_GRAD);
-        seam.find(seamImgs, seamCorners, seamMasks);
-    } catch (const std::exception &) {
-        cv::detail::VoronoiSeamFinder seam;
-        seam.find(seamImgs, seamCorners, seamMasks);
-    }
-    seamImgs.clear();
-    report(0.84, "blending");
-    double blendWidth = std::sqrt((double)eq.W * eq.H) * 5.0 / 100.0;
-    int bands = std::max(1, (int)std::ceil(std::log2(blendWidth)));
-    cv::detail::MultiBandBlender blender(false, bands);
-    int pad = std::max(1 << bands, eq.W / 8);  // (a margin each side of the +-180 edge: a piece near one edge is fed again
-    // a whole turn away, with the same seam, so the pyramid blends the true neighbours there; GCam wrapped its collapse)
-    blender.prepare(cv::Rect(-pad, 0, eq.W + 2 * pad, eq.H));
-    for (int k = 0; k < np; k++) {
-        cv::UMat dilated, seamUp, m;
-        cv::dilate(seamMasks[k], dilated, cv::Mat());
-        cv::resize(dilated, seamUp, masks[k].size(), 0, 0, cv::INTER_LINEAR_EXACT);
-        cv::bitwise_and(seamUp, masks[k], m);
-        cv::UMat img16;
-        imgs[k].convertTo(img16, CV_16S);
-        blender.feed(img16, m, corners[k]);
-        if (corners[k].x < pad) {  // (its part within the margin, a turn to the right)
-            int w = std::min(img16.cols, pad - corners[k].x);
-            blender.feed(img16(cv::Rect(0, 0, w, img16.rows)), m(cv::Rect(0, 0, w, m.rows)), cv::Point(corners[k].x + eq.W, corners[k].y));
+        try {
+            cv::detail::GraphCutSeamFinder seam(cv::detail::GraphCutSeamFinderBase::COST_COLOR_GRAD);
+            seam.find(si, sc, sm);
+        } catch (const std::exception &) {
+            cv::detail::VoronoiSeamFinder seam;
+            seam.find(si, sc, sm);
         }
-        if (corners[k].x + img16.cols > eq.W - pad) {  // (its part within the margin, a turn to the left)
-            int c0 = std::max(0, eq.W - pad - corners[k].x);
-            blender.feed(img16(cv::Rect(c0, 0, img16.cols - c0, img16.rows)), m(cv::Rect(c0, 0, m.cols - c0, m.rows)), cv::Point(corners[k].x - eq.W + c0, corners[k].y));
+        for (size_t k = 0; k < sp.size(); k++) {
+            int i = sp[k].src;
+            if (seamOf[i].empty()) seamOf[i] = Mat::zeros(bS.size(), CV_8U);
+            Mat m = sm[k].getMat(cv::ACCESS_READ).clone();
+            Mat dst = seamOf[i](cv::Rect(sp[k].tl - bS.tl(), m.size()));
+            cv::bitwise_or(dst, m, dst);
         }
-        imgs[k].release();
-        report(0.84 + 0.1 * (k + 1) / np, "blending");
+        for (auto &sm1 : seamOf)
+            if (!sm1.empty()) cv::dilate(sm1, sm1, Mat());
     }
-    Mat result16, resultMask;
-    blender.blend(result16, resultMask);
+    mids.clear();
+
+    // ---- blend (GCam: a 10-level pyramid). Each photo is read again at what the canvas needs (GCam: 1.75 photo pixels
+    // per canvas pixel, never enlarged), its exposure applied, warped into the rectangle, cut by its seam, and let go.
+    // The ten levels in two passes: the five fine ones at full resolution (each photo's detail above 1/32), the five
+    // coarse ones on a canvas 32x smaller; the sum is the 10-level blend at the cost of a 5-level one.
+    report(0.7, "blending");
+    const int fineBands = 5, coarseBands = 5, bands = fineBands + coarseBands, cf = 1 << fineBands;
+    int finePad = full ? 4 * cf : 0;                  // (full circle: margins each side of the +-180 edge, fed the pieces
+    int coarsePad = full ? std::min(4 << coarseBands, W / cf) : 0;  // from the other side, so the pyramids blend the true neighbours
+    // there; GCam wrapped its collapse)
+    cv::detail::MultiBandBlender fine(false, fineBands, CV_16S), coarse(false, coarseBands, CV_16S);
+    cv::Rect fineRoi(bounds.x - finePad, bounds.y, bounds.width + 2 * finePad, bounds.height);
+    auto floorDiv = [](int a, int b) { return a >= 0 ? a / b : -((-a + b - 1) / b); };
+    cv::Rect coarseRoi(floorDiv(bounds.x, cf) - coarsePad, floorDiv(bounds.y, cf), 0, 0);
+    coarseRoi.width = floorDiv(bounds.x + bounds.width + cf - 1, cf) + coarsePad - coarseRoi.x;
+    coarseRoi.height = floorDiv(bounds.y + bounds.height + cf - 1, cf) - coarseRoi.y;
+    fine.prepare(fineRoi);
+    coarse.prepare(coarseRoi);
+    int Wc = eq.W / cf;  // (a full circle's width is a multiple of 512, so of cf)
+    Mat coverage = Mat::zeros(bounds.size(), CV_8U);
+    int np = 0;
+    double composeScale = 1;
+    for (size_t t = 0; t < live.size(); t++) {
+        int i = live[t];
+        Mat img = cv::imread(paths[i], cv::IMREAD_COLOR);
+        if (img.empty()) throw std::runtime_error("can't read " + paths[i]);
+        double cs = std::min(1.0, 1.75 * (W / (2 * kPi)) / focalOf(i));
+        composeScale = cs;
+        if (cs < 0.999) {
+            Mat sm1;
+            cv::resize(img, sm1, cv::Size(), cs, cs, cv::INTER_AREA);
+            img = sm1;
+        }
+        applyGain(img, gammas[i]);
+        double f = focalOf(i) * img.cols / (double)fullSize[i].width;
+        std::vector<Piece> ps;
+        warpPhoto(img, f, (img.cols - 1) / 2.0, (img.rows - 1) / 2.0, R[i], eq, i, ps, bounds.y, bounds.y + bounds.height - 1);
+        img.release();
+        clipPieces(ps, bounds);
+        for (auto &p : ps) {
+            Mat cr = coverage(cv::Rect(p.tl - bounds.tl(), p.mask.size()));
+            cv::bitwise_or(cr, p.mask, cr);
+            if (seamOf[i].empty()) continue;
+            Mat seamPiece, m;
+            cv::Matx23d M(ss, 0, (p.tl.x + 0.5) * ss - 0.5 - bS.x, 0, ss, (p.tl.y + 0.5) * ss - 0.5 - bS.y);
+            cv::warpAffine(seamOf[i], seamPiece, M, p.mask.size(), cv::INTER_LINEAR | cv::WARP_INVERSE_MAP, cv::BORDER_CONSTANT, cv::Scalar(0));
+            cv::bitwise_and(seamPiece, p.mask, m);
+            if (cv::countNonZero(m) == 0) continue;
+            // the piece on cf-aligned ground: its 1/cf average (coarse pass) and the detail above it (fine pass)
+            int ax0 = floorDiv(p.tl.x, cf) * cf, ay0 = floorDiv(p.tl.y, cf) * cf;
+            int ax1 = floorDiv(p.tl.x + p.img.cols + cf - 1, cf) * cf, ay1 = floorDiv(p.tl.y + p.img.rows + cf - 1, cf) * cf;
+            Mat imgA, maskA;
+            cv::copyMakeBorder(p.img, imgA, p.tl.y - ay0, ay1 - p.tl.y - p.img.rows, p.tl.x - ax0, ax1 - p.tl.x - p.img.cols, cv::BORDER_REPLICATE);
+            cv::copyMakeBorder(m, maskA, p.tl.y - ay0, ay1 - p.tl.y - p.img.rows, p.tl.x - ax0, ax1 - p.tl.x - p.img.cols, cv::BORDER_CONSTANT, cv::Scalar(0));
+            Mat low, lowM, up;
+            cv::resize(imgA, low, cv::Size((ax1 - ax0) / cf, (ay1 - ay0) / cf), 0, 0, cv::INTER_AREA);
+            cv::resize(maskA, lowM, low.size(), 0, 0, cv::INTER_AREA);
+            cv::Matx23d Mu(1.0 / cf, 0, 0.5 / cf - 0.5, 0, 1.0 / cf, 0.5 / cf - 0.5);
+            cv::warpAffine(low, up, Mu, imgA.size(), cv::INTER_LINEAR | cv::WARP_INVERSE_MAP, cv::BORDER_REPLICATE);
+            Mat detail;
+            cv::subtract(imgA, up, detail, cv::noArray(), CV_16S);
+            Mat d = detail(cv::Rect(p.tl.x - ax0, p.tl.y - ay0, p.img.cols, p.img.rows));
+            fine.feed(d, m, p.tl);
+            if (full && p.tl.x < finePad) {  // (its part within the margin, a turn to the right)
+                int w = std::min(d.cols, finePad - p.tl.x);
+                fine.feed(d(cv::Rect(0, 0, w, d.rows)), m(cv::Rect(0, 0, w, m.rows)), cv::Point(p.tl.x + eq.W, p.tl.y));
+            }
+            if (full && p.tl.x + d.cols > eq.W - finePad) {  // (its part within the margin, a turn to the left)
+                int c0 = std::max(0, eq.W - finePad - p.tl.x);
+                fine.feed(d(cv::Rect(c0, 0, d.cols - c0, d.rows)), m(cv::Rect(c0, 0, m.cols - c0, m.rows)), cv::Point(p.tl.x - eq.W + c0, p.tl.y));
+            }
+            Mat low16;
+            low.convertTo(low16, CV_16S);
+            cv::Point ctl(ax0 / cf, ay0 / cf);
+            if (ax0 < 0 || ay0 < 0) ctl = cv::Point(floorDiv(ax0, cf), floorDiv(ay0, cf));
+            coarse.feed(low16, lowM, ctl);
+            if (full && ctl.x < coarsePad) {  // (the same in the coarse margins)
+                int w = std::min(low16.cols, coarsePad - ctl.x);
+                coarse.feed(low16(cv::Rect(0, 0, w, low16.rows)), lowM(cv::Rect(0, 0, w, lowM.rows)), cv::Point(ctl.x + Wc, ctl.y));
+            }
+            if (full && ctl.x + low16.cols > Wc - coarsePad) {
+                int c0 = std::max(0, Wc - coarsePad - ctl.x);
+                coarse.feed(low16(cv::Rect(c0, 0, low16.cols - c0, low16.rows)), lowM(cv::Rect(c0, 0, lowM.cols - c0, lowM.rows)), cv::Point(ctl.x - Wc + c0, ctl.y));
+            }
+            np++;
+        }
+        seamOf[i].release();
+        report(0.7 + 0.22 * (t + 1) / live.size(), "blending");
+    }
+    if (np == 0) throw std::runtime_error("nothing to render");
+    report(0.93, "blending");
     Mat result;
-    result16(cv::Rect(pad, 0, eq.W, eq.H)).convertTo(result, CV_8U);
+    {
+        Mat c16, cMask, c8, upC, f16, fMask;
+        coarse.blend(c16, cMask);
+        c16.convertTo(c8, CV_8U);
+        fillOutside(c8, cMask);  // (no black from beyond the photos creeps in when it is enlarged)
+        cv::Matx23d Mc(1.0 / cf, 0, (bounds.x + 0.5) / cf - 0.5 - coarseRoi.x, 0, 1.0 / cf, (bounds.y + 0.5) / cf - 0.5 - coarseRoi.y);
+        cv::warpAffine(c8, upC, Mc, bounds.size(), cv::INTER_LINEAR | cv::WARP_INVERSE_MAP, cv::BORDER_REPLICATE);
+        fine.blend(f16, fMask);
+        Mat sum16;
+        cv::add(f16(cv::Rect(finePad, 0, bounds.width, bounds.height)), upC, sum16, cv::noArray(), CV_16S);
+        sum16.convertTo(result, CV_8U);
+    }
     result.setTo(cv::Scalar(0, 0, 0), coverage == 0);
-    fillHoles(result, coverage);  // (small holes filled from their surroundings, large ones black, as GCam)
-    if (nadirPatchDeg > 0 && cv::countNonZero(coverage.row(eq.H - 1)) == eq.W) {
+    fillHoles(result, coverage);  // (small holes filled from their surroundings)
+    if (nadirPatchDeg > 0 && full && bounds.y + bounds.height == eq.H && cv::countNonZero(coverage.row(coverage.rows - 1)) == coverage.cols) {
         // the ground right under the camera (the photographer's feet) under a plain cap the colour of the floor around
         // it, with a soft edge: a nadir patch, as 360 tools do (GCam left the feet in)
-        int rows = std::min(eq.H / 2, (int)std::lround(eq.H * nadirPatchDeg / 180.0));
+        int rows = std::min(result.rows / 2, (int)std::lround(eq.H * nadirPatchDeg / 180.0));
         if (rows > 4) {
-            cv::Scalar c = cv::mean(result.row(std::max(0, eq.H - rows - 2)));
-            Mat cap(1, eq.W, CV_8UC3, c);
+            cv::Scalar c = cv::mean(result.row(std::max(0, result.rows - rows - 2)));
+            Mat cap(1, result.cols, CV_8UC3, c);
             int soft = std::max(2, rows / 5);
-            for (int y = eq.H - rows; y < eq.H; y++) {
-                double a = std::min(1.0, (y - (eq.H - rows) + 1.0) / soft);
+            for (int y = result.rows - rows; y < result.rows; y++) {
+                double a = std::min(1.0, (y - (result.rows - rows) + 1.0) / soft);
                 cv::addWeighted(cap, a, result.row(y), 1 - a, 0, result.row(y));
             }
         }
     }
-
-    // ---- crop: a full circle keeps its width and loses rows not fully covered (10 deg at most each end); a partial
-    // sphere is cut to what's covered
     report(0.95, "saving");
-    Mat colAny, rowAll, rowAny;
-    cv::reduce(coverage, colAny, 0, cv::REDUCE_MAX);
-    cv::reduce(coverage, rowAny, 1, cv::REDUCE_MAX);
-    cv::reduce(coverage, rowAll, 1, cv::REDUCE_MIN);
-    bool full = cv::countNonZero(colAny) == eq.W;
-    int top = 0, bottom = eq.H - 1, left = 0, right = eq.W - 1;
-    if (full) {
-        int limit = eq.H / 18;
-        while (top < limit && rowAll.at<uchar>(top) == 0) top++;
-        while (bottom > eq.H - 1 - limit && rowAll.at<uchar>(bottom) == 0) bottom--;
-    } else {
-        while (top < eq.H - 1 && rowAny.at<uchar>(top) == 0) top++;
-        while (bottom > top && rowAny.at<uchar>(bottom) == 0) bottom--;
-        while (left < eq.W - 1 && colAny.at<uchar>(left) == 0) left++;
-        while (right > left && colAny.at<uchar>(right) == 0) right--;
-    }
-    Mat cropped = result(cv::Rect(left, top, right - left + 1, bottom - top + 1));
-    if (!cv::imwrite(outputPath, cropped, {cv::IMWRITE_JPEG_QUALITY, 90})) throw std::runtime_error("can't write the panorama");
+    if (!cv::imwrite(outputPath, result, {cv::IMWRITE_JPEG_QUALITY, 90})) throw std::runtime_error("can't write the panorama");
     StitchResult res;
     res.path = outputPath;
     res.fullW = eq.W;
     res.fullH = eq.H;
-    res.cropW = cropped.cols;
-    res.cropH = cropped.rows;
-    res.left = left;
-    res.top = top;
+    res.cropW = result.cols;
+    res.cropH = result.rows;
+    res.left = bounds.x;
+    res.top = bounds.y;
     res.full = full;
+    {
+        Vec3d d = forwardOf(R[0]);
+        res.firstYawDeg = deg(std::atan2(d[0], d[2]));
+    }
     res.images = n;
     res.featurePairs = imagePairs;
     res.directPairs = directPairs;
@@ -1466,9 +1719,10 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
             gmin = std::min(gmin, gammas[i]);
             gmax = std::max(gmax, gammas[i]);
         }
-        char buf[200];
-        snprintf(buf, sizeof buf, "gains %.2f..%.2f (overlaps differed up to %.2fx), %d line matches, %d pairs rejected, %d dropped, compose scale %.2f, %d pieces, %d bands",
-                 gmin, gmax, maxRatio, lineMatches, rejectedPairs, (int)res.dropped.size(), composeScale, np, bands);
+        char buf[360];
+        snprintf(buf, sizeof buf, "%dx%d of a %dx%d sphere (%.1f MP, %.1f px/deg), compose scale %.2f, gains %.2f..%.2f (overlaps differed up to %.2fx), %d line matches, %d pairs rejected, %d dropped, %d pieces, %d bands",
+                 res.cropW, res.cropH, res.fullW, res.fullH, res.cropW * (double)res.cropH / 1e6, res.fullW / 360.0, composeScale, gmin, gmax, maxRatio, lineMatches,
+                 rejectedPairs, (int)res.dropped.size(), np, bands);
         res.notes = buf;
     }
     report(1.0, "done");

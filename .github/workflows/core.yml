@@ -28,8 +28,11 @@ jobs:
           mkdir -p out
           ./harness synth textured out/textured | tee out/textured.txt || true
           ./harness synth room out/room | tee out/room.txt || true
+          ./harness synth textured out/part 70 4096 part | tee out/part.txt || true
           cp out/textured/result.jpg out/textured-pano.jpg; cp out/room/result.jpg out/room-pano.jpg; cp out/room/truth.jpg out/room-truth.jpg
+          cp out/part/result.jpg out/part-pano.jpg || true
           grep -q PASS out/textured.txt
+          grep -q PASS out/part.txt
       - name: the owner's room
         if: always()
         env:
@@ -40,7 +43,7 @@ jobs:
           i=0
           while read -r u; do [ -z "$u" ] && continue; i=$((i + 1)); curl -sL -A "Mozilla/5.0" -o "photos/$(printf %02d "$i").jpg" "$u"; done <<< "$ROOM_URLS"
           echo "$(ls photos | wc -l) photos"
-          time ./harness stitch photos 1470 private/room.jpg 4096 | tee private/room.txt
+          time ./harness stitch photos 1470 private/room.jpg 26 | tee private/room.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with:

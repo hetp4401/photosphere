@@ -1,7 +1,7 @@
 import SwiftUI
 
 /// A test mode for real photos without sensor orientations (a camera app's), run with "-stitchdir <folder in tmp>
-/// -focalPx <f> [-out <name>] [-width <W>]": their orientations are worked out from the images alone, then they go
+/// -focalPx <f> [-out <name>] [-megapixels <MP>]": their orientations are worked out from the images alone, then they go
 /// through the normal stitch. The verdict goes to Documents/<name>.txt, the sphere to Documents/Panoramas/<name>.jpg.
 struct StitchDirView: View {
     @StateObject private var model = StitchDirModel()
@@ -36,7 +36,7 @@ final class StitchDirModel: ObservableObject {
         let dirName = arg("-stitchdir") ?? "room"
         let focal = Double(arg("-focalPx") ?? "") ?? 1344
         let name = arg("-out") ?? dirName
-        let width = Int(arg("-width") ?? "") ?? 4096
+        let megapixels = Double(arg("-megapixels") ?? "") ?? 26
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(dirName)
         Task.detached(priority: .userInitiated) {
             let files = ((try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []).filter { $0.lowercased().hasSuffix(".jpg") }.sorted()
@@ -52,9 +52,9 @@ final class StitchDirModel: ObservableObject {
                 lines.append("bootstrap: placed \(placed.count) of \(paths.count), \(boot["edges"] ?? 0) matched pairs (\(boot["rejected"] ?? 0) rejected), root photo \(boot["root"] ?? -1), \(Int(Date().timeIntervalSince(t0))) s")
                 let used = placed.map { paths[$0.intValue] }
                 let raw = dir.appendingPathComponent("result.jpg").path
-                let res = try PanoStitcher.stitchImages(used, rotations: rots, focalPx: focal, outputWidth: Int32(width), outputPath: raw, priorsFromSensors: false, nadirPatchDeg: 0, progress: show)
+                let res = try PanoStitcher.stitchImages(used, rotations: rots, focalPx: focal, outputMegapixels: megapixels, outputPath: raw, priorsFromSensors: false, nadirPatchDeg: 0, progress: show)
                 let packet = XMP.gpanoPacket(fullWidth: Int(res.fullWidth), fullHeight: Int(res.fullHeight), cropWidth: Int(res.cropWidth), cropHeight: Int(res.cropHeight),
-                                             left: Int(res.cropLeft), top: Int(res.cropTop), headingDeg: 0, firstDate: Date(), lastDate: Date(), sourceCount: used.count, usePanoramaViewer: true)
+                                             left: Int(res.cropLeft), top: Int(res.cropTop), headingDeg: nil, firstDate: Date(), lastDate: Date(), sourceCount: used.count, usePanoramaViewer: true)
                 let data = XMP.embed(packet: packet, in: try Data(contentsOf: URL(fileURLWithPath: raw)))
                 let out = CaptureSession.panoramasDir.appendingPathComponent("\(name).jpg")
                 try data.write(to: out, options: .atomic)

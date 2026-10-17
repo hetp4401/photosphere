@@ -23,6 +23,7 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, copy) NSArray<NSArray<NSNumber *> *> *rotations;
 @property (nonatomic, copy) NSString *notes;
 @property (nonatomic, copy) NSArray<NSNumber *> *dropped;  // indices of photos not rendered (nothing held them; image-only priors)
+@property (nonatomic) double firstYawDeg;  // the first photo's longitude in the output (+ = right of its centre)
 @end
 
 typedef void (^PanoProgress)(double fraction, NSString *stage);
@@ -34,14 +35,15 @@ typedef void (^PanoProgress)(double fraction, NSString *stage);
 
 /// paths: the photos (upright, all the same size). rotations: each photo's world-from-camera matrix from the sensors
 /// (camera frame: x right, y down, z forward; world: y down, z the first photo's forward). focalPx: the lens's focal
-/// length in pixels of those photos. outputWidth: the width of the full 360x180 canvas (its height is half).
+/// length in pixels of those photos. outputMegapixels: the output's pixel budget (Google Camera: 8 low, 26 high, 70 max),
+/// spent on what the photos cover; never more pixels per degree than the photos hold.
 /// priorsFromSensors: YES when the rotations came from the gyro (the app's captures), NO when they were worked out from
 /// the images (bootstrapRotations): then there are no sensor ties, and a photo nothing holds is dropped.
 /// nadirPatchDeg: > 0 paints over that many degrees of ground right under the camera (the photographer's feet).
 + (nullable PanoStitchResult *)stitchImages:(NSArray<NSString *> *)paths
                                   rotations:(NSArray<NSArray<NSNumber *> *> *)rotations
                                     focalPx:(double)focalPx
-                                outputWidth:(int)outputWidth
+                           outputMegapixels:(double)outputMegapixels
                                  outputPath:(NSString *)outputPath
                           priorsFromSensors:(BOOL)priorsFromSensors
                               nadirPatchDeg:(double)nadirPatchDeg

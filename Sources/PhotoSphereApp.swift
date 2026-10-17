@@ -21,7 +21,7 @@ struct RootView: View {
     @State private var capturing = false
     @State private var stitching: CaptureSession?
     @State private var panoramas: [URL] = []
-    @AppStorage("outputWidth") private var outputWidth = 6144
+    @AppStorage("outputMegapixels") private var outputMegapixels = 26.0
     @AppStorage("saveToPhotos") private var saveToPhotos = true
     @AppStorage("nadirPatchDeg") private var nadirPatchDeg = 0.0
 
@@ -53,10 +53,10 @@ struct RootView: View {
                     }
                 }
                 Section("Output") {
-                    Picker("Size", selection: $outputWidth) {
-                        Text("4096 x 2048 (fast)").tag(4096)
-                        Text("6144 x 3072").tag(6144)
-                        Text("8192 x 4096 (slow)").tag(8192)
+                    Picker("Quality", selection: $outputMegapixels) {  // (Google Camera's three: low, high, max)
+                        Text("Low (8 MP)").tag(8.0)
+                        Text("High (26 MP)").tag(26.0)
+                        Text("Max (70 MP, slow)").tag(70.0)
                     }
                     Toggle("Save to Photos", isOn: $saveToPhotos)
                     Picker("Hide the ground under me", selection: $nadirPatchDeg) {

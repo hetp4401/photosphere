@@ -1,8 +1,9 @@
 import Foundation
 import UIKit
 
-/// A capture in progress: its photos on disk (upright, at most 3024 px on the long side; Google Camera used ~1800), each
-/// with the rotation the sensors gave at the moment the dot was hit. The last capture's folder is kept for sharing.
+/// A capture in progress: its photos on disk as the camera made them (its JPEG, EXIF and all; Google Camera wrote the
+/// camera's bytes as they came), each with the rotation the sensors gave at the moment the dot was hit. The last
+/// capture's folder is kept for sharing.
 struct Shot: Codable {
     let file: String
     let rotation: [Double]  // world-from-camera, row-major
@@ -22,7 +23,6 @@ struct SessionInfo: Codable {
 }
 
 final class CaptureSession {
-    static let maxSide = 3024
     let dir: URL
     private(set) var info = SessionInfo()
 
@@ -67,20 +67,19 @@ final class CaptureSession {
         info.vfovDeg = vfovDeg
     }
 
-    /// The photo made upright and shrunk, written as N.jpg; its thumbnail returned for the live mosaic.
-    func add(photo: UIImage, rotation: Mat3, exposure: Double) -> UIImage? {
+    /// The camera's JPEG written as N.jpg as it came (its orientation in the EXIF, which the stitcher applies); its
+    /// upright thumbnail returned for the live mosaic.
+    func add(jpeg data: Data, photo: UIImage, rotation: Mat3, exposure: Double) -> UIImage? {
         let n = info.shots.count
-        let upright = Self.upright(photo, maxSide: Self.maxSide)
-        guard let data = upright.jpegData(compressionQuality: 0.92) else { return nil }
         let name = "\(n).jpg"
-        try? data.write(to: dir.appendingPathComponent(name), options: .atomic)
-        if info.width == 0 {
-            info.width = Int(upright.size.width)
-            info.height = Int(upright.size.height)
+        guard (try? data.write(to: dir.appendingPathComponent(name), options: .atomic)) != nil else { return nil }
+        if info.width == 0 {  // (as seen upright: UIImage applies the orientation)
+            info.width = Int(photo.size.width * photo.scale)
+            info.height = Int(photo.size.height * photo.scale)
         }
         info.shots.append(Shot(file: name, rotation: Orient.flat(rotation), time: Date().timeIntervalSince1970, exposure: exposure))
         save()
-        return Self.upright(upright, maxSide: 512)
+        return Self.upright(photo, maxSide: 512)
     }
 
     func setHeading(_ deg: Double) { info.headingDeg = deg }

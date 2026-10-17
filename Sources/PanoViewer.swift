@@ -25,23 +25,50 @@ struct PanoViewer: UIViewRepresentable {
         private var motionR = Mat3(rows: [SIMD3(1, 0, 0), SIMD3(0, 0, 1), SIMD3(0, -1, 0)])  // (no motion: level, ahead)
         private var fov = 75.0
 
+        /// The piece of a sphere (radius r, seen from its centre) that a crop of a full equirect canvas covers, its texture
+        /// coordinates running over the crop (0,0 its top-left).
+        static func patch(fullW: Double, fullH: Double, cropW: Double, cropH: Double, left: Double, top: Double, radius r: Double) -> SCNGeometry {
+            let nu = max(4, Int(160 * cropW / fullW)), nv = max(2, Int(80 * cropH / fullH))
+            var verts: [SCNVector3] = [], uvs: [CGPoint] = [], idx: [Int32] = []
+            for b in 0...nv {
+                let t = Double(b) / Double(nv)
+                let phi = Double.pi / 2 - (top + t * cropH) / fullH * Double.pi
+                for a in 0...nu {
+                    let s = Double(a) / Double(nu)
+                    let lam = (left + s * cropW) / fullW * 2 * Double.pi - Double.pi
+                    verts.append(SCNVector3(Float(r * cos(phi) * sin(lam)), Float(r * sin(phi)), Float(-r * cos(phi) * cos(lam))))
+                    uvs.append(CGPoint(x: s, y: t))
+                }
+            }
+            for b in 0..<nv {
+                for a in 0..<nu {
+                    let i0 = Int32(b * (nu + 1) + a), i2 = i0 + Int32(nu + 1)
+                    idx += [i0, i2, i0 + 1, i0 + 1, i2, i2 + 1]
+                }
+            }
+            return SCNGeometry(sources: [SCNGeometrySource(vertices: verts), SCNGeometrySource(textureCoordinates: uvs)],
+                               elements: [SCNGeometryElement(indices: idx, primitiveType: .triangles)])
+        }
+
         func attach(view: SCNView, url: URL) {
             view.scene = scene
             view.backgroundColor = .black
             view.isPlaying = true
             view.rendersContinuously = true
             view.antialiasingMode = .multisampling4X
-            let sphere = SCNSphere(radius: 10)
-            sphere.segmentCount = 96
+            // only the part of the sphere the photos cover (GPano's crop of the full canvas), black around it; longitude
+            // 0 (the canvas's centre) ahead along -z, east to the right
+            let crop = XMP.gpanoCrop(of: url)
+            let image = UIImage(contentsOfFile: url.path)
+            let size = image.map { ($0.size.width * $0.scale, $0.size.height * $0.scale) } ?? (2, 1)
+            let (fw, fh, cw, ch, left, top) = crop ?? (Double(size.0), Double(size.0) / 2, Double(size.0), Double(size.1), 0, (Double(size.0) / 2 - Double(size.1)) / 2)
             let m = SCNMaterial()
-            m.diffuse.contents = UIImage(contentsOfFile: url.path)
-            m.diffuse.contentsTransform = SCNMatrix4Translate(SCNMatrix4MakeScale(-1, 1, 1), 1, 0, 0)  // (seen from inside)
-            m.cullMode = .front
+            m.diffuse.contents = image
+            m.isDoubleSided = true
             m.lightingModel = .constant
-            sphere.firstMaterial = m
-            let node = SCNNode(geometry: sphere)
-            node.eulerAngles.y = .pi  // (the texture's centre, longitude 0, ahead: along -z)
-            scene.rootNode.addChildNode(node)
+            let geometry = Self.patch(fullW: fw, fullH: fh, cropW: cw, cropH: ch, left: left, top: top, radius: 10)
+            geometry.firstMaterial = m
+            scene.rootNode.addChildNode(SCNNode(geometry: geometry))
             let cam = SCNCamera()
             cam.zNear = 0.1
             cam.zFar = 50

@@ -1,11 +1,19 @@
 // The pipeline on a Linux box, for fast iteration (the same PanoCore.hpp the app uses):
-//   harness synth <textured|room> <outdir> [fovDeg] [panoWidth]   a synthetic world photographed at the dots, stitched, measured
-//   harness stitch <photo dir> <focalPx> <out.jpg> [width]        real photos (no sensor data): bootstrap + stitch
-//   harness stitchprior <photo dir> <rotations.txt> <focalPx> <out.jpg> [width]   photos with known rotations (9 numbers a line)
+//   harness synth <textured|room> <outdir> [fovDeg] [panoWidth] [part]   a synthetic world photographed at the dots, stitched,
+//   measured ("part": only the dots of one side, within 75 deg of ahead and 50 deg of level, as a partial capture)
+//   harness stitch <photo dir> <focalPx> <out.jpg> [megapixels]   real photos (no sensor data): bootstrap + stitch
+//   harness stitchprior <photo dir> <rotations.txt> <focalPx> <out.jpg> [megapixels]   photos with known rotations (9 numbers a line)
+// megapixels: the output's pixel budget (GCam: 8, 26, 70); a number above 1000 is read as an old-style sphere width.
 #include "../Sources/Native/PanoCore.hpp"
 #include <dirent.h>
 #include <fstream>
 #include <iostream>
+
+static double budgetArg(const char *a, double dflt) {
+    if (!a) return dflt;
+    double v = atof(a);
+    return v > 1000 ? v * v / 2 / 1e6 : v;
+}
 
 static std::vector<std::string> jpegsIn(const std::string &dir) {
     std::vector<std::string> out;
@@ -69,8 +77,18 @@ int main(int argc, char **argv) {
             double H = fov * M_PI / 180, V = 2 * std::atan(std::tan(H / 2) * 1200.0 / 1600.0);
             std::vector<double> yaws, pitches;
             targets(H, V, yaws, pitches);
+            if (argc > 6 && std::string(argv[6]) == "part") {
+                std::vector<double> y2, p2;
+                for (size_t k = 0; k < yaws.size(); k++)
+                    if (std::fabs(std::remainder(yaws[k], 2 * M_PI)) < 75 * M_PI / 180 && std::fabs(pitches[k]) < 50 * M_PI / 180) {
+                        y2.push_back(yaws[k]);
+                        p2.push_back(pitches[k]);
+                    }
+                yaws.swap(y2);
+                pitches.swap(p2);
+            }
             pano::Synth s = pano::generate(dir, yaws, pitches, fov, 1600, 1200, panoW, world);
-            pano::StitchResult r = pano::stitch(s.images, s.priors, s.focalPx, panoW, dir + "/result.jpg", show);
+            pano::StitchResult r = pano::stitch(s.images, s.priors, s.focalPx, panoW * (double)panoW / 2 / 1e6, dir + "/result.jpg", show);
             pano::Metrics m = pano::metrics(r, s.pano, s.truth);
             {  // the worst-placed photos, with where they look
                 std::vector<int> idx(m.perPhotoDeg.size());
@@ -92,7 +110,7 @@ int main(int argc, char **argv) {
             std::vector<std::string> paths = jpegsIn(argv[2]);
             double focal = atof(argv[3]);
             std::string out = argv[4];
-            int width = argc > 5 ? atoi(argv[5]) : 4096;
+            double mp = budgetArg(argc > 5 ? argv[5] : nullptr, 26);
             auto t0 = std::chrono::steady_clock::now();
             pano::Bootstrap b = pano::bootstrap(paths, focal, show);
             double bs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
@@ -103,7 +121,7 @@ int main(int argc, char **argv) {
             printf("\nsecond chance: %s\n", b.log.c_str());
             std::vector<std::string> used;
             for (int i : b.placed) used.push_back(paths[i]);
-            pano::StitchResult r = pano::stitch(used, b.R, focal, width, out, show, false);
+            pano::StitchResult r = pano::stitch(used, b.R, focal, mp, out, show, false);
             printf("stitch: %d photos, %d feature pairs, %d direct pairs, focal %.0f px, crop %dx%d of %dx%d, full circle %d, %.1f s, notes=[%s]; dropped:",
                    r.images, r.featurePairs, r.directPairs, r.focal, r.cropW, r.cropH, r.fullW, r.fullH, r.full ? 1 : 0, r.seconds, r.notes.c_str());
             for (int i : r.dropped) printf(" %s", used[i].substr(used[i].rfind('/') + 1).c_str());
@@ -134,7 +152,7 @@ int main(int argc, char **argv) {
                     R.push_back(m);
                 }
             }
-            pano::StitchResult r = pano::stitch(paths, R, atof(argv[4]), argc > 6 ? atoi(argv[6]) : 4096, argv[5], show);
+            pano::StitchResult r = pano::stitch(paths, R, atof(argv[4]), budgetArg(argc > 6 ? argv[6] : nullptr, 26), argv[5], show);
             printf("stitch: %d photos, %d feature pairs, %d direct pairs, focal %.0f px, crop %dx%d of %dx%d, full circle %d, %.1f s, notes=[%s]\n",
                    r.images, r.featurePairs, r.directPairs, r.focal, r.cropW, r.cropH, r.fullW, r.fullH, r.full ? 1 : 0, r.seconds, r.notes.c_str());
             return 0;

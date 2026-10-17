@@ -56,6 +56,7 @@ final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelega
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = .black
+        UIApplication.shared.isIdleTimerDisabled = true  // (GCam reset the screen timeout at every photo: a capture takes minutes without a touch)
         let preview = AVCaptureVideoPreviewLayer(session: captureSession)
         preview.videoGravity = .resizeAspect  // (the lens's whole frame, as GCam's viewfinder: what you see is the photo)
         preview.frame = view.bounds
@@ -331,7 +332,7 @@ final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelega
         targets?.capture(forward: Orient.forward(R))
         if let t = targets { counterLabel.text = "\(t.capturedCount) of \(t.total)" }
         hintLabel.text = "Hold still…"
-        let settings = AVCapturePhotoSettings(format: [AVVideoCodecKey: AVVideoCodecType.jpeg])
+        let settings = AVCapturePhotoSettings(format: [AVVideoCodecKey: AVVideoCodecType.jpeg, AVVideoCompressionPropertiesKey: [AVVideoQualityKey: 0.95]])
         settings.photoQualityPrioritization = .balanced
         if let c = photoOutput.connection(with: .video) { Self.portrait(c) }
         photoOutput.capturePhoto(with: settings, delegate: self)
@@ -350,7 +351,7 @@ final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelega
             return
         }
         DispatchQueue.global(qos: .userInitiated).async {
-            let thumb = self.session.add(photo: image, rotation: rotation, exposure: exposure)
+            let thumb = self.session.add(jpeg: data, photo: image, rotation: rotation, exposure: exposure)
             DispatchQueue.main.async {
                 self.photoInFlight = false
                 if let thumb {
@@ -395,7 +396,7 @@ final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelega
     }
 
     @objc private func doneTapped() {
-        guard session.count > 0 else { return }
+        guard session.count > 0, !photoInFlight else { return }  // (GCam: not while a photo is being taken)
         finish()
     }
 
@@ -413,6 +414,7 @@ final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelega
 
     private func stop() {
         finished = true
+        UIApplication.shared.isIdleTimerDisabled = false
         motion.stopDeviceMotionUpdates()
         location.stopUpdatingHeading()
         sessionQueue.async { if self.captureSession.isRunning { self.captureSession.stopRunning() } }
