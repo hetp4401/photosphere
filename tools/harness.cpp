@@ -69,6 +69,7 @@ int main(int argc, char **argv) {
         return 2;
     }
     std::string mode = argv[1];
+    if (const char *e = getenv("PANO_EXPOSURE")) pano::gExposureGamma = std::string(e) != "gain";
     try {
         if (mode == "synth" && argc >= 4) {
             std::string world = argv[2], dir = argv[3];

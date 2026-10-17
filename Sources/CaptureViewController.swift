@@ -2,13 +2,16 @@ import AVFoundation
 import AudioToolbox
 import CoreLocation
 import CoreMotion
+import ImageIO
 import SceneKit
 import UIKit
 import simd
 
-/// The capture screen, as Google Camera's Photo Sphere worked: the phone's motion sensors say where the camera points,
-/// dots on a sphere say where to point it next, and a photo is taken by itself when the camera settles on a dot.
-final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelegate, AVCaptureVideoDataOutputSampleBufferDelegate, CLLocationManagerDelegate {
+/// The capture screen, as Google Camera's Photo Sphere worked: the phone's motion sensors alone say where the camera
+/// points, dots on a sphere say where to point it next, and a photo is taken by itself when the camera settles on a dot.
+/// The view is GCam's: the scene seen 1.7x wider than the lens on a dark ground, the camera's frame a fixed outline in the
+/// middle with the live picture inside it until the first photo, then only the photos taken, pasted where they belong.
+final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelegate, CLLocationManagerDelegate {
     var onFinished: ((CaptureSession) -> Void)?
     var onCancel: (() -> Void)?
 
@@ -25,24 +28,17 @@ final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelega
     private var targets: TargetManager?
     private let session = CaptureSession()
     private var hfov = 55.0 * .pi / 180, vfov = 70.0 * .pi / 180  // as held (portrait): short and long sides
-    private var lockedRoll: Double?
+    private var landscape: Bool?   // how the first photo was held (GCam locks the family: upright/upside down, or the two landscapes)
     private var photoInFlight = false
     private var pendingRotation = matrix_identity_double3x3
     private var lastShotAt = Date.distantPast
     private var gyroSpeed = 0.0
     private var stillFor = 0          // motion updates in a row under the speed limit
-    private var movedWhileExposing = 0.0  // the fastest the phone turned while a photo was taken
     private var heading: Double?
     private var finished = false
-    // GCam's live tracker: the preview frames aligned to the photos taken, the gyro's drift corrected by what is seen
-    private let videoOutput = AVCaptureVideoDataOutput()
-    private let videoQueue = DispatchQueue(label: "photosphere.video")
-    private var tracker: PanoTracker?
-    private var drift = matrix_identity_double3x3   // world rotation: corrected = drift * gyro (main thread)
-    private let refLock = NSLock()
-    private var latestRef = matrix_identity_double3x3
-    private var latestSpeed = 0.0
-    private var lastTrackAt = 0.0
+    private var countdownStart: CFTimeInterval?  // GCam's hold on the start dot (the reticle filling over 1.2 s)
+    private let outline = CAShapeLayer()         // the camera's frame
+    private let countdownLayer = CAShapeLayer()
 
     private let hintLabel = UILabel()
     private let counterLabel = UILabel()
@@ -55,17 +51,19 @@ final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelega
 
     override func viewDidLoad() {
         super.viewDidLoad()
-        view.backgroundColor = .black
+        view.backgroundColor = UIColor(white: 0.12, alpha: 1)
         UIApplication.shared.isIdleTimerDisabled = true  // (GCam reset the screen timeout at every photo: a capture takes minutes without a touch)
+        scnView = SCNView(frame: view.bounds)
+        overlay = SphereOverlay(view: scnView, transparent: false)
+        view.addSubview(scnView)
         let preview = AVCaptureVideoPreviewLayer(session: captureSession)
-        preview.videoGravity = .resizeAspect  // (the lens's whole frame, as GCam's viewfinder: what you see is the photo)
-        preview.frame = view.bounds
+        preview.videoGravity = .resizeAspectFill  // (inside the frame's outline, which has the photo's shape: the lens's whole frame)
         view.layer.addSublayer(preview)
         previewLayer = preview
-
-        scnView = SCNView(frame: view.bounds)
-        overlay = SphereOverlay(view: scnView, transparent: true)
-        view.addSubview(scnView)
+        outline.strokeColor = UIColor.white.cgColor
+        outline.fillColor = UIColor.clear.cgColor
+        outline.lineWidth = 3
+        view.layer.addSublayer(outline)
         buildUI()
         checkCameraAccess()
         startMotion()
@@ -75,26 +73,38 @@ final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelega
         }
     }
 
-    /// The overlay's view is laid exactly over the preview's frame, with the photo's own field of view, so the dots and
-    /// the pasted photos sit on the scene.
+    /// GCam's view (LightCycleRenderer): the screen's width spans 1.7x the tangent of the lens's long side, so the camera's
+    /// frame is a fixed rectangle about 44% of the width in the middle; the live picture fills it until the first photo.
     private func layoutPreview() {
-        guard let preview = previewLayer else { return }
-        let rect = preview.layerRectConverted(fromMetadataOutputRect: CGRect(x: 0, y: 0, width: 1, height: 1))
-        scnView.frame = rect.width > 0 && rect.height > 0 && rect.width <= view.bounds.width + 1 ? rect : view.bounds
-        overlay.setVisibleHfov(hfov * 180 / .pi)
+        scnView.frame = view.bounds
+        let tanV = tan(vfov / 2), tanH = tan(hfov / 2)
+        overlay.setVisibleHfov(2 * atan(1.7 * tanV) * 180 / .pi)
+        let scale = (view.bounds.width / 2) / CGFloat(1.7 * tanV)  // (points per unit of tangent, both ways)
+        let fw = 2 * CGFloat(tanH) * scale, fh = 2 * CGFloat(tanV) * scale
+        let rect = CGRect(x: view.bounds.midX - fw / 2, y: view.bounds.midY - fh / 2, width: fw, height: fh)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        previewLayer?.frame = rect
+        outline.path = UIBezierPath(rect: rect).cgPath
+        CATransaction.commit()
     }
 
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
-        previewLayer?.frame = view.bounds
         layoutPreview()
     }
 
     private func buildUI() {
-        reticle.layer.borderColor = UIColor.white.withAlphaComponent(0.9).cgColor
+        reticle.layer.borderColor = UIColor.white.withAlphaComponent(0.5).cgColor  // (GCam's reticle: at the centre, half opaque)
         reticle.layer.borderWidth = 2
-        reticle.layer.cornerRadius = 12
+        reticle.layer.cornerRadius = 22
         reticle.isUserInteractionEnabled = false
+        countdownLayer.path = UIBezierPath(arcCenter: CGPoint(x: 22, y: 22), radius: 17, startAngle: -.pi / 2, endAngle: 1.5 * .pi, clockwise: true).cgPath
+        countdownLayer.strokeColor = UIColor.white.cgColor
+        countdownLayer.fillColor = UIColor.clear.cgColor
+        countdownLayer.lineWidth = 6
+        countdownLayer.strokeEnd = 0
+        reticle.layer.addSublayer(countdownLayer)
         view.addSubview(reticle)
         hintLabel.textColor = .white
         hintLabel.font = .systemFont(ofSize: 17, weight: .semibold)
@@ -124,7 +134,7 @@ final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelega
         let g = view.safeAreaLayoutGuide
         NSLayoutConstraint.activate([
             reticle.centerXAnchor.constraint(equalTo: view.centerXAnchor), reticle.centerYAnchor.constraint(equalTo: view.centerYAnchor),
-            reticle.widthAnchor.constraint(equalToConstant: 150), reticle.heightAnchor.constraint(equalToConstant: 150),
+            reticle.widthAnchor.constraint(equalToConstant: 44), reticle.heightAnchor.constraint(equalToConstant: 44),
             hintLabel.topAnchor.constraint(equalTo: g.topAnchor, constant: 24), hintLabel.leadingAnchor.constraint(equalTo: g.leadingAnchor, constant: 24),
             hintLabel.trailingAnchor.constraint(equalTo: g.trailingAnchor, constant: -24),
             counterLabel.topAnchor.constraint(equalTo: hintLabel.bottomAnchor, constant: 8), counterLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
@@ -164,11 +174,6 @@ final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelega
             }
             self.captureSession.addInput(input)
             if self.captureSession.canAddOutput(self.photoOutput) { self.captureSession.addOutput(self.photoOutput) }
-            self.videoOutput.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange]
-            self.videoOutput.alwaysDiscardsLateVideoFrames = true
-            self.videoOutput.setSampleBufferDelegate(self, queue: self.videoQueue)
-            if self.captureSession.canAddOutput(self.videoOutput) { self.captureSession.addOutput(self.videoOutput) }
-            if let c = self.videoOutput.connection(with: .video) { Self.portrait(c) }
             self.photoOutput.maxPhotoQualityPrioritization = .balanced  // (the camera's own processing, as the Camera app)
             self.captureSession.commitConfiguration()
             self.device = dev
@@ -212,74 +217,83 @@ final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelega
 
     private func handle(_ m: CMDeviceMotion) {
         let refFromDevice = Orient.refFromDevice(m)
-        let R = drift * world.worldFromCam(refFromDevice: refFromDevice)  // (the gyro, corrected by the tracker)
+        let R = world.worldFromCam(refFromDevice: refFromDevice)  // (the sensors alone, as GCam's EKF: nothing seen corrects it)
         let rr = m.rotationRate
         gyroSpeed = simd_length(SIMD3(rr.x, rr.y, rr.z))
-        refLock.lock()
-        latestRef = refFromDevice
-        latestSpeed = gyroSpeed
-        refLock.unlock()
         overlay.setCamera(R)
-        let f = Orient.forward(R), pitch = Orient.pitch(R), roll = Orient.roll(R)
+        let f = Orient.forward(R), pitch = Orient.pitch(R), roll = Orient.fullRoll(R)
         let hit = TargetManager.hitAngle(gyroSpeed: gyroSpeed)
         let exposure = device?.exposureDuration.seconds ?? 1.0 / 60
         let limit = TargetManager.speedLimit(exposureSeconds: exposure)
         stillFor = gyroSpeed > limit ? 0 : stillFor + 1
         let tooFast = stillFor < 4  // (under the limit for 40 ms: not just passing through)
-        if photoInFlight { movedWhileExposing = max(movedWhileExposing, gyroSpeed) }
         let canShoot = device != nil && !photoInFlight && Date().timeIntervalSince(lastShotAt) > 0.4
+        // GCam's roll check (DeviceOrientationStatus): within 20 deg of upright or upside down, or of the two landscape ways
+        // (the way the first photo was held decides); not checked pointing up past 40 deg (nor, here, near straight down,
+        // where the roll is undefined)
+        let rollOK = pitch > 40 * .pi / 180 || pitch < -70 * .pi / 180 || Self.rollOK(roll, landscape: landscape)
 
         if let targets {
             guard let near = targets.nearest(to: f, among: [.active]) else { return }
             let (t, a) = near
-            overlay.syncDots(targets.targets, inRange: a < 15 * .pi / 180 ? t.id : nil)
-            let rollOK = abs(pitch) > 40 * .pi / 180 || Self.within(roll, lockedRoll ?? 0, 20 * .pi / 180)
+            overlay.syncDots(targets.targets, inRange: a < 15 * .pi / 180 ? t.id : nil, forward: f)
             if a < hit && canShoot {
                 if tooFast {
                     hintLabel.text = "Hold still"
                 } else if !rollOK {
-                    hintLabel.text = "Keep the phone \(lockedRoll == 0 ? "upright" : "turned as the first photo")"
+                    hintLabel.text = "Keep the phone straight"
                 } else {
                     takePhoto(rotation: R)
                 }
             } else if photoInFlight {
-                hintLabel.text = "Hold still…"
+                hintLabel.text = "Hold still\u{2026}"
             } else {
                 hintLabel.text = a < 15 * .pi / 180 ? "Centre the dot" : "Turn to the next dot"
             }
         } else {
             let hitting = abs(pitch) < hit
             overlay.showFloatingDot(yaw: Orient.yaw(R), hit: hitting)
+            var counting = false
             if pitch > 20 * .pi / 180 {
                 hintLabel.text = "Tilt down to the horizon"
             } else if pitch < -20 * .pi / 180 {
                 hintLabel.text = "Tilt up to the horizon"
-            } else if hitting && canShoot {
-                if tooFast {
-                    hintLabel.text = "Hold still"
-                } else {
+            } else if !rollOK {
+                hintLabel.text = "Hold the phone straight"
+            } else if hitting && canShoot && !tooFast {
+                // GCam's start: hold on the dot while the reticle fills (three steps, 1.2 s), the lens focusing once meanwhile
+                counting = true
+                let now = CACurrentMediaTime()
+                if countdownStart == nil {
+                    countdownStart = now
+                    focusOnce()
+                }
+                let elapsed = now - (countdownStart ?? now)
+                countdownLayer.strokeEnd = CGFloat(min(1, Double(Int(elapsed / 0.4) + 1) / 3))
+                hintLabel.text = "Hold still"
+                if elapsed >= 1.2 && !(device?.isAdjustingFocus ?? false) {
                     firstPhoto(refFromDevice: refFromDevice)
+                    return
                 }
             } else {
-                hintLabel.text = "Centre the dot on the horizon"
+                hintLabel.text = hitting && tooFast ? "Hold still" : "Centre the dot on the horizon"
+            }
+            if !counting {
+                countdownStart = nil
+                countdownLayer.strokeEnd = 0
             }
         }
     }
 
-    // MARK: the live tracker (on the video queue)
-
-    func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
-        let now = CACurrentMediaTime()
-        guard now - lastTrackAt > 0.08, let tracker, let pb = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-        lastTrackAt = now
-        refLock.lock()
-        let ref = latestRef, speed = latestSpeed
-        refLock.unlock()
-        guard speed < 0.6 else { return }  // (only when the frame is sharp enough to align)
-        let Rg = world.worldFromCam(refFromDevice: ref)
-        if tracker.track(pb, gyro: Orient.flat(Rg).map { NSNumber(value: $0) }) {
-            let d = Orient.matrix(tracker.drift().map { $0.doubleValue })
-            DispatchQueue.main.async { self.drift = d }
+    /// Within 20 deg of upright or upside down, or of the two landscape ways; once a capture started, only its own pair.
+    private static func rollOK(_ roll: Double, landscape: Bool?) -> Bool {
+        let tol = 20 * Double.pi / 180
+        let portrait = within(roll, 0, tol) || within(roll, .pi, tol)
+        let land = within(roll, .pi / 2, tol) || within(roll, -.pi / 2, tol)
+        switch landscape {
+        case .some(true): return land
+        case .some(false): return portrait
+        case .none: return portrait || land
         }
     }
 
@@ -290,27 +304,37 @@ final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelega
     }
 
     private func firstPhoto(refFromDevice: Mat3) {
+        countdownStart = nil
+        countdownLayer.strokeEnd = 0
         lockLens()
         world.fix(refFromDevice: refFromDevice)
-        drift = matrix_identity_double3x3
-        tracker = PanoTracker(shortFovDeg: hfov * 180 / .pi)
         let R = world.worldFromCam(refFromDevice: refFromDevice)
-        let roll = Orient.roll(R)
-        let uprights: [Double] = [0, .pi / 2, -.pi / 2, .pi]
-        lockedRoll = uprights.min(by: { abs($0 - roll) < abs($1 - roll) })
-        targets = TargetManager(hfov: hfov, vfov: vfov)
+        let roll = Orient.fullRoll(R)
+        let land = Self.within(roll, .pi / 2, .pi / 4) || Self.within(roll, -.pi / 2, .pi / 4)
+        landscape = land
+        // the dots laid out by how the phone is held (GCam: landscape, the long side runs along the rings)
+        targets = land ? TargetManager(hfov: vfov, vfov: hfov) : TargetManager(hfov: hfov, vfov: vfov)
         overlay.clearDots()
         if let h = heading { session.setHeading(h) }
         takePhoto(rotation: R)
+        previewLayer?.isHidden = true  // (GCam: from the first photo on, the mosaic and the frame's outline only)
+        overlay.revealDots()
     }
 
-    /// From the first photo on, the lens stays focused at infinity (GCam: FOCUS_MODE_INFINITY), so every photo has the same
-    /// field of view (autofocus changes it a little), and the white balance stays as it was.
+    /// From the first photo on the focus stays where the start's one autofocus put it (GCam's path for phones that can't
+    /// focus at infinity: one focus at the start dot, then held). Exposure and white balance keep adjusting photo by photo,
+    /// as GCam left them (it never locked them); the stitcher evens the photos out.
     private func lockLens() {
         guard let dev = device, (try? dev.lockForConfiguration()) != nil else { return }
-        if dev.isFocusModeSupported(.locked) { dev.focusMode = .locked }  // (where it focused on the first view: a room's distance)
-        if dev.isExposureModeSupported(.locked) { dev.exposureMode = .locked }  // (one exposure for the whole sphere)
-        if dev.isWhiteBalanceModeSupported(.locked) { dev.whiteBalanceMode = .locked }
+        if dev.isFocusModeSupported(.locked) { dev.focusMode = .locked }
+        dev.unlockForConfiguration()
+    }
+
+    /// One autofocus at the middle of the frame (GCam's autoFocusIfRequired at the start dot).
+    private func focusOnce() {
+        guard let dev = device, (try? dev.lockForConfiguration()) != nil else { return }
+        if dev.isFocusPointOfInterestSupported { dev.focusPointOfInterest = CGPoint(x: 0.5, y: 0.5) }
+        if dev.isFocusModeSupported(.autoFocus) { dev.focusMode = .autoFocus }
         dev.unlockForConfiguration()
     }
 
@@ -327,7 +351,6 @@ final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelega
     private func takePhoto(rotation R: Mat3) {
         photoInFlight = true
         pendingRotation = R
-        movedWhileExposing = 0
         lastShotAt = Date()
         targets?.capture(forward: Orient.forward(R))
         if let t = targets { counterLabel.text = "\(t.capturedCount) of \(t.total)" }
@@ -335,29 +358,26 @@ final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelega
         let settings = AVCapturePhotoSettings(format: [AVVideoCodecKey: AVVideoCodecType.jpeg, AVVideoCompressionPropertiesKey: [AVVideoQualityKey: 0.95]])
         settings.photoQualityPrioritization = .balanced
         if let c = photoOutput.connection(with: .video) { Self.portrait(c) }
-        photoOutput.capturePhoto(with: settings, delegate: self)
-        AudioServicesPlaySystemSound(1108)
+        photoOutput.capturePhoto(with: settings, delegate: self)  // (the system's shutter sound marks the exposure, as GCam's onShutter)
+    }
+
+    func photoOutput(_ output: AVCapturePhotoOutput, didCapturePhotoFor resolvedSettings: AVCaptureResolvedPhotoSettings) {
+        DispatchQueue.main.async { if self.hintLabel.text == "Hold still\u{2026}" { self.hintLabel.text = "" } }  // (exposed: free to turn)
     }
 
     func photoOutput(_ output: AVCapturePhotoOutput, didFinishProcessingPhoto photo: AVCapturePhoto, error: Error?) {
         let rotation = pendingRotation
-        let exposure = device?.exposureDuration.seconds ?? 0
+        let exif = photo.metadata[kCGImagePropertyExifDictionary as String] as? [String: Any]
+        let exposure = (exif?[kCGImagePropertyExifExposureTime as String] as? Double) ?? device?.exposureDuration.seconds ?? 0  // (GCam read it from the EXIF)
         guard error == nil, let data = photo.fileDataRepresentation(), let image = UIImage(data: data) else {
             DispatchQueue.main.async { self.photoFailed() }
-            return
-        }
-        if movedWhileExposing > 2 * TargetManager.speedLimit(exposureSeconds: exposure) {  // (it turned while exposing: blurred)
-            DispatchQueue.main.async { self.photoFailed(blurred: true) }
             return
         }
         DispatchQueue.global(qos: .userInitiated).async {
             let thumb = self.session.add(jpeg: data, photo: image, rotation: rotation, exposure: exposure)
             DispatchQueue.main.async {
                 self.photoInFlight = false
-                if let thumb {
-                    self.overlay.addPhoto(thumb, rotation: rotation)
-                    self.tracker?.addKeyframe(thumb, rotation: Orient.flat(rotation).map { NSNumber(value: $0) })
-                }
+                if let thumb { self.overlay.addPhoto(thumb, rotation: rotation) }
                 self.undoButton.isHidden = false
                 self.doneButton.isHidden = false
                 if let t = self.targets, t.allCaptured { self.finish() }
@@ -365,20 +385,19 @@ final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelega
         }
     }
 
-    private func photoFailed(blurred: Bool = false) {
+    private func photoFailed() {
         photoInFlight = false
         targets?.undo()
         if session.count == 0 { resetToStart() }
-        hintLabel.text = blurred ? "Moved too much, hold still" : "The photo failed, try again"
+        hintLabel.text = "The photo failed, try again"
     }
 
     private func resetToStart() {
         unlockLens()
         targets = nil
-        tracker = nil
-        drift = matrix_identity_double3x3
         world.release()
-        lockedRoll = nil
+        landscape = nil
+        previewLayer?.isHidden = false
         overlay.clearDots()
         overlay.clearPhotos()
         counterLabel.text = ""
@@ -388,7 +407,6 @@ final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelega
 
     @objc private func undoTapped() {
         guard !photoInFlight, session.count > 0 else { return }
-        tracker?.removeLast()
         session.removeLast()
         targets?.undo()
         overlay.removeLastPhoto()

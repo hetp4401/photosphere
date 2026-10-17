@@ -9,6 +9,7 @@
 #include <cmath>
 #include <functional>
 #include <map>
+#include <set>
 #include <mutex>
 #include <random>
 #include <stdexcept>
@@ -73,7 +74,7 @@ constexpr double kPi = CV_PI;
 constexpr int kMatchWidth = 1600;        // the photos are matched at this size (GCam: image_match_width)
 constexpr double kHuberPx = 35.0;        // the match residual's Huber scale, in match pixels (GCam: HuberLoss(35))
 constexpr double kRansacInlierDeg = 1.1; // a match is an inlier of a pairwise rotation within this (GCam: 1.1 deg)
-constexpr int kRansacMin = 550, kRansacMax = 5000, kRansacEnough = 150;
+constexpr int kRansacMin = 550, kRansacMax = 5000, kRansacEnough = 150, kMinInliers = 7;  // (GCam: SphericalPairwiseMatcher {550, 5000, 7, 150})
 constexpr int kKeepMatches = 35;         // inliers kept per pair for the global adjustment (GCam: 35, stratified)
 constexpr double kRatio = 0.8;           // Lowe's ratio (GCam: 0.64 on squared distances)
 constexpr double kAxesNear = 0.9;        // two photos are candidates when their axes are within this times the FOV
@@ -81,9 +82,12 @@ constexpr double kLatGateDeg = 9.0;
 constexpr double kCycleDeg = 4.0;        // without a gyro, a pair is believed when a third photo closes the triangle within this
 constexpr int kStrongEdge = 40;          // ...or when it has this many inliers on its own
 constexpr double kSupportPx = 25.0;
-constexpr double kFocalPriorPx = 300.0;  // a weak pull of the focal toward the lens's: a phone turned at arm's length fits a longer one
+constexpr double kFocalPriorPx = 0.0;    // no pull on the focal (GCam: none; only the 10..150 deg FOV check after the solve)  // a weak pull of the focal toward the lens's: a phone turned at arm's length fits a longer one
 constexpr double kPriorAgreeDeg = 10.0;  // without a gyro, a pair must agree with the verified placement within this      // ...and a photo stays when one of its matches holds within this after the adjustment
-constexpr double kGammaMax = 2.5;        // a photo's gamma at most (GCam: 1.75; an iPhone's auto exposure spans more)      // and a match's two rays must lie within this latitude band (GCam: 6 deg bins +-1)
+constexpr double kGammaMax = 1.75;       // a photo's gamma at most (GCam: ComputeRosetteGammaAdjustment(.., 1.75))
+/// The exposure model: true, GCam's one gamma per photo (black and white stay put, so a photo exposed for a window keeps
+/// its window); false, one gain per photo in linear light.
+inline bool gExposureGamma = true;      // and a match's two rays must lie within this latitude band (GCam: 6 deg bins +-1)
 
 double deg(double r) { return r * 180.0 / kPi; }
 double rad(double d) { return d * kPi / 180.0; }
@@ -500,6 +504,7 @@ struct PairMatch {
     double w = 1;
     bool sensor = false, direct = false;
     int inliers = 0, putative = 0;
+    Matx33d Rji = Matx33d::eye();    // camera j from camera i, as the images said (feature pairs)
 };
 
 Vec3d rayOf(double x, double y, double f, double cx, double cy) { return unit(Vec3d((x - cx) / f, (y - cy) / f, 1)); }
@@ -511,16 +516,17 @@ bool ransacRotation(const std::vector<Vec3d> &a, const std::vector<Vec3d> &b, st
     double cosTol = std::cos(rad(kRansacInlierDeg)), cos5 = std::cos(rad(5));
     std::uniform_int_distribution<int> pick(0, n - 1);
     std::vector<int> best;
-    for (int it = 0; it < kRansacMax; it++) {
+    for (int it = 0, draws = 0; it < kRansacMax && draws < 50 * kRansacMax; draws++) {
         int p = pick(rng), q = pick(rng);
-        if (p == q || a[p].dot(a[q]) > cos5) continue;  // (two rays at least 5 deg apart)
+        if (p == q || a[p].dot(a[q]) > cos5) continue;  // (two rays at least 5 deg apart; a redraw doesn't count, as GCam's)
+        it++;
         std::vector<int> two = {p, q};
         Matx33d Rc = kabsch(a, b, &two);
         std::vector<int> cur;
         for (int k = 0; k < n; k++)
             if ((Rc * a[k]).dot(b[k]) > cosTol) cur.push_back(k);
         if (cur.size() > best.size()) best = cur;
-        if (it >= kRansacMin && (int)best.size() >= kRansacEnough) break;
+        if ((int)best.size() >= kRansacEnough || (it >= kRansacMin && (int)best.size() >= kMinInliers)) break;  // (GCam's exits)
     }
     if (best.size() < 2) return false;
     R = kabsch(a, b, &best);
@@ -564,6 +570,7 @@ struct BAProblem {
     std::vector<double> cxs, cys;    // each photo's centre at match scale
     double ws = 0;                   // the gravity priors' weight (GCam: 0.0125 * matches / images)
     std::vector<double> pitch0, roll0;
+    bool fixFocal = false;           // the focal held (GCam's line pass)
 };
 
 void baRotations(const BAProblem &P, const std::vector<double> &x, std::vector<Matx33d> &R) {
@@ -603,11 +610,25 @@ void baResiduals(const BAProblem &P, const std::vector<double> &x, std::vector<d
             side(Rij, lm.j, lm.i, lm.aj, lm.bj, lm.ai, lm.bi);
         }
     }
-    r.push_back(kFocalPriorPx * x[3 * P.n]);  // (the focal stays near the lens's own value)
-    for (int i = 0; i < P.n; i++) {  // the gravity priors: tilt, and roll with half the weight (GCam: SensorResidual, RollPitchSensorResidual)
-        r.push_back(P.ws * f * (pitchOf(R[i]) - P.pitch0[i]));
-        r.push_back(std::fabs(P.pitch0[i]) < rad(81) ? 0.5 * P.ws * f * (rollOf(R[i]) - P.roll0[i]) : 0.0);
+    if (kFocalPriorPx > 0) r.push_back(kFocalPriorPx * x[3 * P.n]);
+    // the gravity priors, not robust (GCam: TrivialLoss): a sphere of 7 photos or more, the tilt only, as w f tan(error)
+    // (SensorResidual); fewer, the tilt and the roll with half the weight, the roll not near a pole (RollPitchSensorResidual)
+    for (int i = 0; i < P.n; i++) {
+        if (P.n >= 7) {
+            r.push_back(P.ws * f * std::tan(pitchOf(R[i]) - P.pitch0[i]));
+        } else {
+            r.push_back(P.ws * f * (pitchOf(R[i]) - P.pitch0[i]));
+            r.push_back(std::fabs(P.pitch0[i]) < rad(81) ? 0.5 * P.ws * f * (rollOf(R[i]) - P.roll0[i]) : 0.0);
+        }
     }
+}
+
+/// How many of the residuals are the matches' and the lines' (the robust ones; the priors after them are not).
+inline int robustCount(const BAProblem &P) {
+    int c = 0;
+    for (auto &pm : *P.pairs) c += 2 * (int)pm.pi.size();
+    if (P.lines) c += 4 * (int)P.lines->size();
+    return c;
 }
 
 /// A pair's median reprojection distance in match pixels under the given rotations and focal.
@@ -627,27 +648,27 @@ inline double medianResidual(const PairMatch &pm, const std::vector<Matx33d> &R,
     return e[e.size() / 2];
 }
 
-double baCost(const std::vector<double> &r) {
+double baCost(const std::vector<double> &r, int nRobust) {
     double c = 0;
-    for (double v : r) {
-        double a = std::fabs(v);
-        c += a <= kHuberPx ? v * v : 2 * kHuberPx * a - kHuberPx * kHuberPx;
+    for (size_t k = 0; k < r.size(); k++) {
+        double v = r[k], a = std::fabs(v);
+        c += ((int)k >= nRobust || a <= kHuberPx) ? v * v : 2 * kHuberPx * a - kHuberPx * kHuberPx;
     }
     return c;
 }
 
 /// Levenberg-Marquardt with a numeric Jacobian and Huber weights (IRLS): 3 rotation parameters a photo, one log focal.
 void bundleAdjust(const BAProblem &P, std::vector<Matx33d> &Rout, double &fOut, int maxIter = 50) {
-    int n = P.n, np = 3 * n + 1;
-    std::vector<double> x(np, 0.0), r, rt;
+    int n = P.n, np = 3 * n + (P.fixFocal ? 0 : 1), nRobust = robustCount(P);
+    std::vector<double> x(3 * n + 1, 0.0), r, rt;
     baResiduals(P, x, r);
-    double cost = baCost(r), lambda = 1e-3;
+    double cost = baCost(r, nRobust), lambda = 1e-3;
     for (int it = 0; it < maxIter; it++) {
         int M = (int)r.size();
         std::vector<double> wgt(M);
         for (int k = 0; k < M; k++) {
             double a = std::fabs(r[k]);
-            wgt[k] = a <= kHuberPx ? 1.0 : std::sqrt(kHuberPx / a);
+            wgt[k] = (k >= nRobust || a <= kHuberPx) ? 1.0 : std::sqrt(kHuberPx / a);
         }
         Mat J(M, np, CV_64F), rw(M, 1, CV_64F);
         std::vector<double> xp = x;
@@ -669,14 +690,14 @@ void bundleAdjust(const BAProblem &P, std::vector<Matx33d> &Rout, double &fOut, 
                 lambda *= 10;
                 continue;
             }
-            std::vector<double> xn(np);
+            std::vector<double> xn = x;
             double step = 0;
             for (int p = 0; p < np; p++) {
                 xn[p] = x[p] + dx.at<double>(p);
                 step += dx.at<double>(p) * dx.at<double>(p);
             }
             baResiduals(P, xn, rt);
-            double c1 = baCost(rt);
+            double c1 = baCost(rt, nRobust);
             if (c1 < cost) {
                 done = (cost - c1) < 1e-6 * cost || step < 1e-14;
                 x = xn;
@@ -861,6 +882,106 @@ inline void clipPieces(std::vector<Piece> &ps, const cv::Rect &r) {
     }
     ps.swap(out);
 }
+
+/// GCam's multiband blend (Blender::CreateMultiband with 10 levels; CreateMask: a level's mask is the level-0 mask taken
+/// at stride 2^level, not spread): every photo's Laplacian pyramid, and at each level a pixel takes the coefficient of the
+/// photo that owns it after the seams (the later photo where two claim it), so no photo tints places it doesn't own; the
+/// pyramid is then collapsed, which spreads each seam's difference over 2^level pixels at that level. The fine levels come
+/// from the photo at full size with a small margin, the coarse ones from its 1/2^split level with a wide one: about one
+/// pass over each photo whatever the blend distance.
+class LevelBlender {
+public:
+    explicit LevelBlender(cv::Rect roi, int levels = 10, int split = 5) : roi_(roi), L_(levels), S_(std::max(1, std::min(split, levels - 1))) {
+        int q = 1 << (L_ - 1);
+        int w = (roi.width + q - 1) / q * q, h = (roi.height + q - 1) / q * q;
+        for (int k = 0; k < L_; k++) pyr_.push_back(Mat::zeros(h >> k, w >> k, CV_16SC3));
+        topSet_ = Mat::zeros(h >> (L_ - 1), w >> (L_ - 1), CV_8U);
+    }
+
+    /// img: a photo's piece (8UC3, its colours spread beyond its edge); own: where it is to be used (8U); tl: on the canvas.
+    void feed(const Mat &img, const Mat &own, cv::Point tl) {
+        cv::Point p = tl - roi_.tl();
+        int qf = 1 << S_, mf = 3 << S_;
+        int x0 = fdiv(p.x - mf, qf) * qf, y0 = fdiv(p.y - mf, qf) * qf;
+        int x1 = fdiv(p.x + img.cols + mf + qf - 1, qf) * qf, y1 = fdiv(p.y + img.rows + mf + qf - 1, qf) * qf;
+        if (x1 <= 0 || y1 <= 0 || x0 >= pyr_[0].cols || y0 >= pyr_[0].rows) return;
+        Mat a, ownA;
+        cv::copyMakeBorder(img, a, p.y - y0, y1 - p.y - img.rows, p.x - x0, x1 - p.x - img.cols, cv::BORDER_REPLICATE);
+        cv::copyMakeBorder(own, ownA, p.y - y0, y1 - p.y - img.rows, p.x - x0, x1 - p.x - img.cols, cv::BORDER_CONSTANT, cv::Scalar(0));
+        std::vector<Mat> G(S_ + 1);
+        a.convertTo(G[0], CV_16S);
+        a.release();
+        for (int k = 1; k <= S_; k++) cv::pyrDown(G[k - 1], G[k]);
+        for (int k = 0; k < S_; k++) {
+            Mat up, lap;
+            cv::pyrUp(G[k + 1], up, G[k].size());
+            cv::subtract(G[k], up, lap);
+            put(k, lap, ownA, x0 / (1 << k), y0 / (1 << k));
+            G[k].release();
+        }
+        int Lc = L_ - S_, qc = 1 << (Lc - 1), mc = 3 << (Lc - 1);
+        int cx = x0 / qf, cy = y0 / qf;
+        int c0x = fdiv(cx - mc, qc) * qc, c0y = fdiv(cy - mc, qc) * qc;
+        int c1x = fdiv(cx + G[S_].cols + mc + qc - 1, qc) * qc, c1y = fdiv(cy + G[S_].rows + mc + qc - 1, qc) * qc;
+        Mat ownS, ownC;
+        cv::resize(ownA, ownS, G[S_].size(), 0, 0, cv::INTER_NEAREST);
+        std::vector<Mat> C(Lc);
+        cv::copyMakeBorder(G[S_], C[0], cy - c0y, c1y - cy - G[S_].rows, cx - c0x, c1x - cx - G[S_].cols, cv::BORDER_REPLICATE);
+        cv::copyMakeBorder(ownS, ownC, cy - c0y, c1y - cy - G[S_].rows, cx - c0x, c1x - cx - G[S_].cols, cv::BORDER_CONSTANT, cv::Scalar(0));
+        for (int j = 1; j < Lc; j++) cv::pyrDown(C[j - 1], C[j]);
+        for (int j = 0; j < Lc; j++) {
+            if (j + 1 < Lc) {
+                Mat up, lap;
+                cv::pyrUp(C[j + 1], up, C[j].size());
+                cv::subtract(C[j], up, lap);
+                put(S_ + j, lap, ownC, c0x / (1 << j), c0y / (1 << j));
+            } else {
+                put(S_ + j, C[j], ownC, c0x / (1 << j), c0y / (1 << j));
+            }
+        }
+    }
+
+    /// The blend over the region given (8UC3); where no photo was fed it holds the nearest colours (black is the caller's).
+    Mat result() {
+        Mat top8;
+        pyr_[L_ - 1].convertTo(top8, CV_8U);
+        fillOutside(top8, topSet_);  // (the coarsest level where nobody wrote: the nearest written value, no black creeping in)
+        top8.convertTo(pyr_[L_ - 1], CV_16S);
+        Mat r = pyr_[L_ - 1];
+        for (int k = L_ - 2; k >= 0; k--) {
+            Mat up;
+            cv::pyrUp(r, up, pyr_[k].size());
+            cv::add(pyr_[k], up, up);
+            r = up;
+            pyr_[k + 1].release();
+        }
+        Mat out;
+        r(cv::Rect(0, 0, roi_.width, roi_.height)).convertTo(out, CV_8U);
+        return out;
+    }
+
+private:
+    static int fdiv(int a, int b) { return a >= 0 ? a / b : -((-a + b - 1) / b); }
+
+    void put(int k, const Mat &coef, const Mat &own, int ox, int oy) {
+        Mat m;
+        cv::resize(own, m, coef.size(), 0, 0, cv::INTER_NEAREST);  // (the mask taken at stride 2^level, as GCam's CreateMask)
+        cv::Rect dst(ox, oy, coef.cols, coef.rows), clip = dst & cv::Rect(0, 0, pyr_[k].cols, pyr_[k].rows);
+        if (clip.area() <= 0) return;
+        cv::Rect src(clip.x - ox, clip.y - oy, clip.width, clip.height);
+        Mat target = pyr_[k](clip);
+        coef(src).copyTo(target, m(src));
+        if (k == L_ - 1) {
+            Mat t = topSet_(clip);
+            t.setTo(255, m(src));
+        }
+    }
+
+    cv::Rect roi_;
+    int L_, S_;
+    std::vector<Mat> pyr_;
+    Mat topSet_;
+};
 
 /// Warps one photo onto the equirect canvas: its bounding box from its border (a pole inside it: the whole width), an
 /// inverse map over that box (each canvas pixel to a photo pixel), the photo sampled bilinearly, and the result cut into
@@ -1180,14 +1301,20 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
             Matx33d Rvis;                 // camera j from camera i, from the images
             std::vector<int> inl;
             if (!ransacRotation(ra, rb, rng, Rvis, inl)) continue;
-            if ((int)inl.size() < 10 || (int)inl.size() <= 5 + 0.15 * (int)ra.size()) continue;  // (INLIER_FAIL; and under 10 a chance)
+            int inView = 0;  // (GCam's VerifyMatchInliers: inliers > 5 + 0.15 x the matches that land inside the other photo)
+            for (auto &d0 : ra) {
+                Vec3d d = Rvis * d0;
+                if (d[2] <= 1e-6) continue;
+                double px = fm * d[0] / d[2] + b.cx, py = fm * d[1] / d[2] + b.cy;
+                if (px >= 0 && py >= 0 && px <= b.w - 1 && py <= b.h - 1) inView++;
+            }
+            if ((int)inl.size() < kMinInliers || (int)inl.size() <= 5 + 0.15 * inView) continue;  // (INLIER_FAIL)
             if (!sensors && ((int)inl.size() < 12 || angleOf(Rvis * (b.Rp.t() * a.Rp).t()) > rad(kPriorAgreeDeg))) continue;  // (a chance match)
-            if (sensors) {
-                Matx33d Rsens = b.Rp.t() * a.Rp, E = Rvis * Rsens.t();
-                // (a phone's gyro is good to a few degrees between neighbours and drifts with the gap; GCam allowed 25 deg a step)
-                double tol = rad(std::min(6.0 + 0.5 * (j - i), 25.0));
-                Vec3d upj = b.Rp.t() * Vec3d(0, -1, 0);
-                if (angleOf(E) > tol || angleBetween(E * upj, upj) > rad(12.5)) continue;  // (GEO_FAIL: not what the sensors say)
+            if (sensors) {  // GEO_FAIL (GCam's VerifyMatchGeometry): the images' rotation against the sensors', in the world frame,
+                // per axis: 12.5 deg of tilt and of roll, 25 deg of yaw a step apart in capture order (65 at most)
+                Matx33d D = b.Rp * Rvis * a.Rp.t();
+                double ex = std::asin(clamp1(D(1, 2))), ey = std::atan2(D(0, 2), D(2, 2)), ez = std::atan2(D(1, 0), D(1, 1));
+                if (std::fabs(ex) > rad(12.5) || std::fabs(ez) > rad(12.5) || std::fabs(ey) > rad(std::min(25.0 * (j - i), 65.0))) continue;
             }
             std::vector<cv::KeyPoint> kpsA;
             for (int k : inl) kpsA.push_back(a.kps[ka[k]]);
@@ -1199,6 +1326,7 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
             pm.j = j;
             pm.inliers = (int)inl.size();
             pm.putative = (int)ra.size();
+            pm.Rji = Rvis;
             pm.w = std::sqrt(inl.size() / (double)kKeepMatches);
             for (int k : keep) {
                 pm.pi.push_back(Point2d(a.kps[ka[inl[k]]].pt.x, a.kps[ka[inl[k]]].pt.y));
@@ -1213,15 +1341,52 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
             matched[j].push_back(i);
         }
     }
-    int imagePairs = (int)pairs.size(), directPairs = 0, lineMatches = 0, rejectedPairs = 0;
+    // ---- wrong pairs out before the adjustment (GCam: RemoveBadPairs(10 deg)): three photos matched pairwise must agree
+    // (the rotations composed around the triangle within 10 deg); from the bad triangles, the pair in the most of them
+    // goes (the weakest when tied), until none is left
+    int rejectedPairs = 0;
+    for (int round = 0; round < 1000; round++) {
+        std::map<std::pair<int, int>, int> at;
+        for (int k = 0; k < (int)pairs.size(); k++) at[{pairs[k].i, pairs[k].j}] = k;
+        std::vector<int> bad(pairs.size(), 0);
+        bool any = false;
+        for (int i = 0; i < n; i++)
+            for (int j : matched[i]) {
+                if (j <= i) continue;
+                for (int k : matched[j]) {
+                    if (k <= j) continue;
+                    auto ij = at.find({i, j}), jk = at.find({j, k}), ik = at.find({i, k});
+                    if (ij == at.end() || jk == at.end() || ik == at.end()) continue;
+                    double e = angleOf(pairs[jk->second].Rji * pairs[ij->second].Rji * pairs[ik->second].Rji.t());
+                    if (e > rad(10)) {
+                        bad[ij->second]++;
+                        bad[jk->second]++;
+                        bad[ik->second]++;
+                        any = true;
+                    }
+                }
+            }
+        if (!any) break;
+        int worst = -1;
+        for (int k = 0; k < (int)pairs.size(); k++)
+            if (bad[k] > 0 && (worst < 0 || bad[k] > bad[worst] || (bad[k] == bad[worst] && pairs[k].inliers < pairs[worst].inliers))) worst = k;
+        int wi = pairs[worst].i, wj = pairs[worst].j;
+        matched[wi].erase(std::remove(matched[wi].begin(), matched[wi].end(), wj), matched[wi].end());
+        matched[wj].erase(std::remove(matched[wj].begin(), matched[wj].end(), wi), matched[wj].end());
+        pairs.erase(pairs.begin() + worst);
+        rejectedPairs++;
+    }
+    int imagePairs = (int)pairs.size(), directPairs = 0, lineMatches = 0;
     std::vector<LineMatch> lines;
     int keptPoints = 0;
     for (auto &p : pairs) keptPoints += (int)p.pi.size();
     // sensor pairs: a weak tie between each photo and the one before when no image match links them (GCam: SENSOR_PAIR,
     // a 3x3 grid transferred through the sensors, weight 0.125 or 0.25 when the axes are near)
+    std::vector<bool> needsLines(n, false);
     for (int i = 1; i < n && sensors; i++) {
         bool linked = std::find(matched[i].begin(), matched[i].end(), i - 1) != matched[i].end();
-        if (linked) continue;
+        if (linked || (!matched[i].empty() && !matched[i - 1].empty())) continue;  // (GCam: only for a photo that matched nothing)
+        needsLines[i - 1] = needsLines[i] = true;
         View &a = views[i - 1], &b = views[i];
         PairMatch pm;
         pm.i = i - 1;
@@ -1320,18 +1485,40 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
         // ---- plain walls: the photos' straight edges matched under the adjusted rotations (GCam's line features), and pairs
         // the features left weak aligned directly on the pixels; both feed a second adjustment, then the lines once more
         report(0.56, "aligning plain walls");
-        auto matchAllLines = [&](const std::vector<Matx33d> &Rc) {
+        auto matchAllLines = [&](const std::vector<Matx33d> &Rc, bool onlyNeeding) {
             lines.clear();
             for (int i = 0; i < n; i++)
                 for (int j = i + 1; j < n; j++)
-                    if (!dead[i] && !dead[j] && angleBetween(forwardOf(Rc[i]), forwardOf(Rc[j])) < 0.9 * fovLong)
+                    if (!dead[i] && !dead[j] && (!onlyNeeding || needsLines[i] || needsLines[j]) && angleBetween(forwardOf(Rc[i]), forwardOf(Rc[j])) < 0.9 * fovLong)
                         matchLines(i, j, views[i].lines, views[j].lines, Rc[j].t() * Rc[i], fm, views[i].cx, views[i].cy, views[j].cx, views[j].cy, views[j].w,
                                    views[j].h, lines);
             return (int)lines.size();
         };
-        lineMatches = matchAllLines(R);
         int refined = 0;
-        for (int i = 0; i < n; i++) {
+        if (sensors) {
+            // GCam's line pass (LineAligner, after the main adjustment): lines for the photos that matched nothing, the sensor
+            // ties between photos the lines now hold cut to an eighth, and one more adjustment with the focal held
+            lineMatches = matchAllLines(R, true);
+            if (lineMatches > 0) {
+                std::set<std::pair<int, int>> held;
+                for (auto &lm : lines) held.insert({std::min(lm.i, lm.j), std::max(lm.i, lm.j)});
+                for (auto &pm : pairs)
+                    if (pm.sensor && held.count({std::min(pm.i, pm.j), std::max(pm.i, pm.j)})) pm.w *= 0.125;
+                BAProblem P2 = P;
+                P2.R0 = R;
+                P2.f0 = fAdj;
+                P2.lines = &lines;
+                P2.fixFocal = true;
+                std::vector<Matx33d> R2;
+                double f2 = fAdj;
+                bundleAdjust(P2, R2, f2);
+                Matx33d G2 = rotY(yawOf(P.R0[0]) - yawOf(R2[0]));
+                for (auto &Ri : R2) Ri = G2 * Ri;
+                R = R2;
+            }
+        }
+        if (!sensors) lineMatches = matchAllLines(R, false);
+        for (int i = 0; i < n && !sensors; i++) {
             for (int j = i + 1; j < n; j++) {
                 View &a = views[i], &b = views[j];
                 if (dead[i] || dead[j] || angleBetween(forwardOf(R[i]), forwardOf(R[j])) >= 0.8 * fovLong) continue;
@@ -1366,7 +1553,7 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
                 }
             }
         }
-        for (int pass = 0; pass < 2 && (refined > 0 || lineMatches > 0); pass++) {
+        for (int pass = 0; pass < 2 && !sensors && (refined > 0 || lineMatches > 0); pass++) {
             BAProblem P2 = P;
             P2.R0 = R;
             P2.f0 = fAdj;
@@ -1381,7 +1568,7 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
                 R = R2;
                 fAdj = f2;
             }
-            if (pass == 0) lineMatches = matchAllLines(R);  // (matched again from the better rotations, then adjusted once more)
+            if (pass == 0) lineMatches = matchAllLines(R, false);  // (matched again from the better rotations, then adjusted once more)
         }
         directPairs = refined;
         if (!sensors) {  // a photo with no match of its own (placed by the pixels) must agree with a neighbour's edges where it ended up
@@ -1513,15 +1700,20 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
         bounds = cv::Rect(x0, y0, std::max(1, x1 - x0), std::max(1, y1 - y0)) & cv::Rect(0, 0, eq.W, eq.H);
     }
 
-    // ---- exposure: one gain per photo from the overlaps
+    // ---- exposure: one gamma per photo from the overlaps (GCam), or one gain
     report(0.6, "matching exposure");
     std::vector<double> gammas;
     double maxRatio = 1;
     {
         std::vector<Mat> smalls(n);
         for (int i : live) cv::resize(mids[i], smalls[i], cv::Size(), 0.5, 0.5, cv::INTER_AREA);
-        gammas = matchGains(smalls, R, fAdj * 0.25, maxRatio);
+        if (gExposureGamma) matchExposure(smalls, R, fAdj * 0.25, gammas);
+        else gammas = matchGains(smalls, R, fAdj * 0.25, maxRatio);
     }
+    auto applyExposure = [&](Mat &img, double g) {
+        if (gExposureGamma) applyGamma(img, g);
+        else applyGain(img, g);
+    };
 
     // ---- seams (GCam: graph cuts on a 512-wide mosaic): cut on about half a megapixel of the rendered rectangle
     report(0.64, "finding seams");
@@ -1537,7 +1729,7 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
         std::vector<Piece> sp;
         for (int i : live) {
             Mat m = mids[i].clone();
-            applyGain(m, gammas[i]);
+            applyExposure(m, gammas[i]);
             double f = fAdj * m.cols / (double)views[i].w;
             warpPhoto(m, f, (m.cols - 1) / 2.0, (m.rows - 1) / 2.0, R[i], eqS, i, sp, bS.y, bS.y + bS.height - 1);
         }
@@ -1569,24 +1761,14 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
     }
     mids.clear();
 
-    // ---- blend (GCam: a 10-level pyramid). Each photo is read again at what the canvas needs (GCam: 1.75 photo pixels
-    // per canvas pixel, never enlarged), its exposure applied, warped into the rectangle, cut by its seam, and let go.
-    // The ten levels in two passes: the five fine ones at full resolution (each photo's detail above 1/32), the five
-    // coarse ones on a canvas 32x smaller; the sum is the 10-level blend at the cost of a 5-level one.
+    // ---- blend (GCam: a 10-level pyramid, each level's pixel from the photo that owns it). Each photo is read again at
+    // what the canvas needs (GCam: 1.75 photo pixels per canvas pixel, never enlarged), its exposure applied, warped into
+    // the rectangle, cut by its seam, fed, and let go.
     report(0.7, "blending");
-    const int fineBands = 5, coarseBands = 5, bands = fineBands + coarseBands, cf = 1 << fineBands;
-    int finePad = full ? 4 * cf : 0;                  // (full circle: margins each side of the +-180 edge, fed the pieces
-    int coarsePad = full ? std::min(4 << coarseBands, W / cf) : 0;  // from the other side, so the pyramids blend the true neighbours
-    // there; GCam wrapped its collapse)
-    cv::detail::MultiBandBlender fine(false, fineBands, CV_16S), coarse(false, coarseBands, CV_16S);
-    cv::Rect fineRoi(bounds.x - finePad, bounds.y, bounds.width + 2 * finePad, bounds.height);
-    auto floorDiv = [](int a, int b) { return a >= 0 ? a / b : -((-a + b - 1) / b); };
-    cv::Rect coarseRoi(floorDiv(bounds.x, cf) - coarsePad, floorDiv(bounds.y, cf), 0, 0);
-    coarseRoi.width = floorDiv(bounds.x + bounds.width + cf - 1, cf) + coarsePad - coarseRoi.x;
-    coarseRoi.height = floorDiv(bounds.y + bounds.height + cf - 1, cf) - coarseRoi.y;
-    fine.prepare(fineRoi);
-    coarse.prepare(coarseRoi);
-    int Wc = eq.W / cf;  // (a full circle's width is a multiple of 512, so of cf)
+    const int bands = 10;
+    int pad = full ? std::min(1 << bands, W / 2) : 0;  // (full circle: margins each side of the +-180 edge, fed the photos
+    // from the other side, so the pyramid collapses with the true neighbours there; GCam wrapped its collapse)
+    LevelBlender blender(cv::Rect(bounds.x - pad, bounds.y, bounds.width + 2 * pad, bounds.height), bands);
     Mat coverage = Mat::zeros(bounds.size(), CV_8U);
     int np = 0;
     double composeScale = 1;
@@ -1601,7 +1783,7 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
             cv::resize(img, sm1, cv::Size(), cs, cs, cv::INTER_AREA);
             img = sm1;
         }
-        applyGain(img, gammas[i]);
+        applyExposure(img, gammas[i]);
         double f = focalOf(i) * img.cols / (double)fullSize[i].width;
         std::vector<Piece> ps;
         warpPhoto(img, f, (img.cols - 1) / 2.0, (img.rows - 1) / 2.0, R[i], eq, i, ps, bounds.y, bounds.y + bounds.height - 1);
@@ -1616,42 +1798,9 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
             cv::warpAffine(seamOf[i], seamPiece, M, p.mask.size(), cv::INTER_LINEAR | cv::WARP_INVERSE_MAP, cv::BORDER_CONSTANT, cv::Scalar(0));
             cv::bitwise_and(seamPiece, p.mask, m);
             if (cv::countNonZero(m) == 0) continue;
-            // the piece on cf-aligned ground: its 1/cf average (coarse pass) and the detail above it (fine pass)
-            int ax0 = floorDiv(p.tl.x, cf) * cf, ay0 = floorDiv(p.tl.y, cf) * cf;
-            int ax1 = floorDiv(p.tl.x + p.img.cols + cf - 1, cf) * cf, ay1 = floorDiv(p.tl.y + p.img.rows + cf - 1, cf) * cf;
-            Mat imgA, maskA;
-            cv::copyMakeBorder(p.img, imgA, p.tl.y - ay0, ay1 - p.tl.y - p.img.rows, p.tl.x - ax0, ax1 - p.tl.x - p.img.cols, cv::BORDER_REPLICATE);
-            cv::copyMakeBorder(m, maskA, p.tl.y - ay0, ay1 - p.tl.y - p.img.rows, p.tl.x - ax0, ax1 - p.tl.x - p.img.cols, cv::BORDER_CONSTANT, cv::Scalar(0));
-            Mat low, lowM, up;
-            cv::resize(imgA, low, cv::Size((ax1 - ax0) / cf, (ay1 - ay0) / cf), 0, 0, cv::INTER_AREA);
-            cv::resize(maskA, lowM, low.size(), 0, 0, cv::INTER_AREA);
-            cv::Matx23d Mu(1.0 / cf, 0, 0.5 / cf - 0.5, 0, 1.0 / cf, 0.5 / cf - 0.5);
-            cv::warpAffine(low, up, Mu, imgA.size(), cv::INTER_LINEAR | cv::WARP_INVERSE_MAP, cv::BORDER_REPLICATE);
-            Mat detail;
-            cv::subtract(imgA, up, detail, cv::noArray(), CV_16S);
-            Mat d = detail(cv::Rect(p.tl.x - ax0, p.tl.y - ay0, p.img.cols, p.img.rows));
-            fine.feed(d, m, p.tl);
-            if (full && p.tl.x < finePad) {  // (its part within the margin, a turn to the right)
-                int w = std::min(d.cols, finePad - p.tl.x);
-                fine.feed(d(cv::Rect(0, 0, w, d.rows)), m(cv::Rect(0, 0, w, m.rows)), cv::Point(p.tl.x + eq.W, p.tl.y));
-            }
-            if (full && p.tl.x + d.cols > eq.W - finePad) {  // (its part within the margin, a turn to the left)
-                int c0 = std::max(0, eq.W - finePad - p.tl.x);
-                fine.feed(d(cv::Rect(c0, 0, d.cols - c0, d.rows)), m(cv::Rect(c0, 0, m.cols - c0, m.rows)), cv::Point(p.tl.x - eq.W + c0, p.tl.y));
-            }
-            Mat low16;
-            low.convertTo(low16, CV_16S);
-            cv::Point ctl(ax0 / cf, ay0 / cf);
-            if (ax0 < 0 || ay0 < 0) ctl = cv::Point(floorDiv(ax0, cf), floorDiv(ay0, cf));
-            coarse.feed(low16, lowM, ctl);
-            if (full && ctl.x < coarsePad) {  // (the same in the coarse margins)
-                int w = std::min(low16.cols, coarsePad - ctl.x);
-                coarse.feed(low16(cv::Rect(0, 0, w, low16.rows)), lowM(cv::Rect(0, 0, w, lowM.rows)), cv::Point(ctl.x + Wc, ctl.y));
-            }
-            if (full && ctl.x + low16.cols > Wc - coarsePad) {
-                int c0 = std::max(0, Wc - coarsePad - ctl.x);
-                coarse.feed(low16(cv::Rect(c0, 0, low16.cols - c0, low16.rows)), lowM(cv::Rect(c0, 0, lowM.cols - c0, lowM.rows)), cv::Point(ctl.x - Wc + c0, ctl.y));
-            }
+            blender.feed(p.img, m, p.tl);
+            if (full && p.tl.x < pad) blender.feed(p.img, m, cv::Point(p.tl.x + eq.W, p.tl.y));  // (again a turn to the right)
+            if (full && p.tl.x + p.img.cols > eq.W - pad) blender.feed(p.img, m, cv::Point(p.tl.x - eq.W, p.tl.y));  // (and to the left)
             np++;
         }
         seamOf[i].release();
@@ -1661,16 +1810,8 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
     report(0.93, "blending");
     Mat result;
     {
-        Mat c16, cMask, c8, upC, f16, fMask;
-        coarse.blend(c16, cMask);
-        c16.convertTo(c8, CV_8U);
-        fillOutside(c8, cMask);  // (no black from beyond the photos creeps in when it is enlarged)
-        cv::Matx23d Mc(1.0 / cf, 0, (bounds.x + 0.5) / cf - 0.5 - coarseRoi.x, 0, 1.0 / cf, (bounds.y + 0.5) / cf - 0.5 - coarseRoi.y);
-        cv::warpAffine(c8, upC, Mc, bounds.size(), cv::INTER_LINEAR | cv::WARP_INVERSE_MAP, cv::BORDER_REPLICATE);
-        fine.blend(f16, fMask);
-        Mat sum16;
-        cv::add(f16(cv::Rect(finePad, 0, bounds.width, bounds.height)), upC, sum16, cv::noArray(), CV_16S);
-        sum16.convertTo(result, CV_8U);
+        Mat all = blender.result();
+        result = all(cv::Rect(pad, 0, bounds.width, bounds.height)).clone();
     }
     result.setTo(cv::Scalar(0, 0, 0), coverage == 0);
     fillHoles(result, coverage);  // (small holes filled from their surroundings)
@@ -1720,8 +1861,8 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
             gmax = std::max(gmax, gammas[i]);
         }
         char buf[360];
-        snprintf(buf, sizeof buf, "%dx%d of a %dx%d sphere (%.1f MP, %.1f px/deg), compose scale %.2f, gains %.2f..%.2f (overlaps differed up to %.2fx), %d line matches, %d pairs rejected, %d dropped, %d pieces, %d bands",
-                 res.cropW, res.cropH, res.fullW, res.fullH, res.cropW * (double)res.cropH / 1e6, res.fullW / 360.0, composeScale, gmin, gmax, maxRatio, lineMatches,
+        snprintf(buf, sizeof buf, "%dx%d of a %dx%d sphere (%.1f MP, %.1f px/deg), compose scale %.2f, %s %.2f..%.2f (overlaps differed up to %.2fx), %d line matches, %d pairs rejected, %d dropped, %d pieces, %d bands",
+                 res.cropW, res.cropH, res.fullW, res.fullH, res.cropW * (double)res.cropH / 1e6, res.fullW / 360.0, composeScale, gExposureGamma ? "gammas" : "gains", gmin, gmax, maxRatio, lineMatches,
                  rejectedPairs, (int)res.dropped.size(), np, bands);
         res.notes = buf;
     }

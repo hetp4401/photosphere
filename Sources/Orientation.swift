@@ -28,6 +28,8 @@ enum Orient {
     static func yaw(_ R: Mat3) -> Double { atan2(R.columns.2.x, R.columns.2.z) }
     static func pitch(_ R: Mat3) -> Double { asin(max(-1, min(1, -R.columns.2.y))) }
     static func roll(_ R: Mat3) -> Double { asin(max(-1, min(1, R.columns.0.y))) }
+    /// The roll over the whole turn: 0 upright, pi/2 turned so the camera's x points down, pi upside down.
+    static func fullRoll(_ R: Mat3) -> Double { atan2(R.columns.0.y, R.columns.1.y) }
 
     static func direction(yaw: Double, pitch: Double) -> SIMD3<Double> {
         SIMD3(cos(pitch) * sin(yaw), -sin(pitch), cos(pitch) * cos(yaw))
