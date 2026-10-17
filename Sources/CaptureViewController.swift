@@ -276,8 +276,8 @@ final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelega
         refLock.unlock()
         guard speed < 0.6 else { return }  // (only when the frame is sharp enough to align)
         let Rg = world.worldFromCam(refFromDevice: ref)
-        if tracker.track(pb, gyro: Orient.flat(Rg)) {
-            let d = Orient.matrix(tracker.drift())
+        if tracker.track(pb, gyro: Orient.flat(Rg).map { NSNumber(value: $0) }) {
+            let d = Orient.matrix(tracker.drift().map { $0.doubleValue })
             DispatchQueue.main.async { self.drift = d }
         }
     }
@@ -355,7 +355,7 @@ final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelega
                 self.photoInFlight = false
                 if let thumb {
                     self.overlay.addPhoto(thumb, rotation: rotation)
-                    self.tracker?.addKeyframe(thumb, rotation: Orient.flat(rotation))
+                    self.tracker?.addKeyframe(thumb, rotation: Orient.flat(rotation).map { NSNumber(value: $0) })
                 }
                 self.undoButton.isHidden = false
                 self.doneButton.isHidden = false
