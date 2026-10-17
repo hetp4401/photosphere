@@ -259,12 +259,109 @@ struct View {
     int w = 0, h = 0;                // at match scale
     double scale = 1;                // match pixels per photo pixel
     Small s16, s8, s4;               // for the direct alignment: 1/16, 1/8 and 1/4 of match scale
+    std::vector<LineSeg> lines;      // its straight edges
     std::vector<cv::KeyPoint> kps;
     Mat desc;
     std::vector<Vec3d> rays;         // camera-frame unit rays of the keypoints
     std::vector<double> lat;         // their latitude under the sensor prior
     Matx33d Rp;                      // the sensor prior, world-from-camera
 };
+
+struct LineSeg {
+    Point2d a, b;
+    double len = 0;
+};
+
+struct LineMatch {
+    int i = 0, j = 0;
+    Point2d ai, bi;  // the segment in i
+    Point2d aj, bj;  // the matched segment in j
+    double w = 0.5;
+};
+
+/// The straight edges of a photo (walls, frames, furniture), the longest first, at match scale.
+inline std::vector<LineSeg> detectLines(const Mat &gray) {
+    std::vector<LineSeg> out;
+    try {
+        cv::Ptr<cv::LineSegmentDetector> lsd = cv::createLineSegmentDetector(cv::LSD_REFINE_STD);
+        std::vector<cv::Vec4f> ls;
+        lsd->detect(gray, ls);
+        for (auto &l : ls) {
+            LineSeg s;
+            s.a = Point2d(l[0], l[1]);
+            s.b = Point2d(l[2], l[3]);
+            s.len = cv::norm(s.a - s.b);
+            if (s.len >= 40) out.push_back(s);
+        }
+    } catch (const std::exception &) {
+    }
+    std::sort(out.begin(), out.end(), [](const LineSeg &x, const LineSeg &y) { return x.len > y.len; });
+    if (out.size() > 300) out.resize(300);
+    return out;
+}
+
+inline double distToLine(const Point2d &p, const Point2d &a, const Point2d &b) {
+    Point2d d = b - a, v = p - a;
+    double len = cv::norm(d);
+    return len > 1e-9 ? std::fabs(v.x * d.y - v.y * d.x) / len : cv::norm(v);
+}
+
+/// Segments of photo i matched to segments of photo j under the current rotations: the endpoints transferred, the
+/// nearest segment of about the same direction that they lie close to and overlap, mutual best (GCam: LineFeatureMatcher).
+inline void matchLines(int i, int j, const std::vector<LineSeg> &li, const std::vector<LineSeg> &lj, const Matx33d &Rji, double f, double cx, double cy,
+                       int wj, int hj, std::vector<LineMatch> &out, int cap = 60) {
+    auto transfer = [&](const Point2d &p, Point2d &q) {
+        Vec3d d = Rji * Vec3d((p.x - cx) / f, (p.y - cy) / f, 1);
+        if (d[2] <= 0.1) return false;
+        q = Point2d(f * d[0] / d[2] + cx, f * d[1] / d[2] + cy);
+        return q.x > -0.2 * wj && q.y > -0.2 * hj && q.x < 1.2 * wj && q.y < 1.2 * hj;
+    };
+    std::vector<int> bestFor(li.size(), -1), bestBack(lj.size(), -1);
+    std::vector<double> bestScore(li.size(), 1e9), bestBackScore(lj.size(), 1e9);
+    for (size_t s = 0; s < li.size(); s++) {
+        Point2d qa, qb;
+        if (!transfer(li[s].a, qa) || !transfer(li[s].b, qb)) continue;
+        Point2d dq = qb - qa;
+        double lq = cv::norm(dq);
+        if (lq < 20) continue;
+        for (size_t t = 0; t < lj.size(); t++) {
+            Point2d dt = lj[t].b - lj[t].a;
+            double cosang = std::fabs(dq.dot(dt)) / (lq * lj[t].len);
+            if (cosang < std::cos(rad(8))) continue;
+            double d1 = distToLine(qa, lj[t].a, lj[t].b), d2 = distToLine(qb, lj[t].a, lj[t].b);
+            if (d1 > 30 || d2 > 30) continue;
+            // overlap along the line
+            Point2d u = dt * (1.0 / lj[t].len);
+            double pa = (qa - lj[t].a).dot(u), pb = (qb - lj[t].a).dot(u);
+            double lo = std::max(0.0, std::min(pa, pb)), hi = std::min(lj[t].len, std::max(pa, pb));
+            if (hi - lo < 0.3 * std::min(lq, lj[t].len)) continue;
+            double score = d1 + d2;
+            if (score < bestScore[s]) {
+                bestScore[s] = score;
+                bestFor[s] = (int)t;
+            }
+            if (score < bestBackScore[t]) {
+                bestBackScore[t] = score;
+                bestBack[t] = (int)s;
+            }
+        }
+    }
+    std::vector<std::pair<double, int>> order;
+    for (size_t s = 0; s < li.size(); s++)
+        if (bestFor[s] >= 0 && bestBack[bestFor[s]] == (int)s) order.push_back({bestScore[s], (int)s});
+    std::sort(order.begin(), order.end());
+    for (size_t k = 0; k < order.size() && (int)k < cap; k++) {
+        int s = order[k].second, t = bestFor[s];
+        LineMatch m;
+        m.i = i;
+        m.j = j;
+        m.ai = li[s].a;
+        m.bi = li[s].b;
+        m.aj = lj[t].a;
+        m.bj = lj[t].b;
+        out.push_back(m);
+    }
+}
 
 struct PairMatch {
     int i = 0, j = 0;
@@ -332,6 +429,7 @@ struct BAProblem {
     int n = 0;
     std::vector<Matx33d> R0;         // the priors
     std::vector<PairMatch> *pairs = nullptr;
+    std::vector<LineMatch> *lines = nullptr;
     double f0 = 1, cx = 0, cy = 0;   // match-scale intrinsics
     double ws = 0;                   // the gravity priors' weight (GCam: 0.0125 * matches / images)
     std::vector<double> pitch0, roll0;
@@ -355,6 +453,23 @@ void baResiduals(const BAProblem &P, const std::vector<double> &x, std::vector<d
             double w = pm.w * (k < pm.wk.size() ? pm.wk[k] : 1.0);
             r.push_back(w * (f * d[0] / z + P.cx - pm.pj[k].x));
             r.push_back(w * (f * d[1] / z + P.cy - pm.pj[k].y));
+        }
+    }
+    if (P.lines) {  // (GCam: LineMatchResidual: each segment's transferred endpoints' distances to the other photo's line, both ways)
+        for (auto &lm : *P.lines) {
+            Matx33d Rji = R[lm.j].t() * R[lm.i], Rij = Rji.t();
+            auto side = [&](const Matx33d &Rt, const Point2d &a, const Point2d &b, const Point2d &la, const Point2d &lb) {
+                for (const Point2d &p : {a, b}) {
+                    Vec3d d = Rt * Vec3d((p.x - P.cx) / f, (p.y - P.cy) / f, 1);
+                    double z = std::max(d[2], 0.05);
+                    Point2d q(f * d[0] / z + P.cx, f * d[1] / z + P.cy);
+                    Point2d dl = lb - la, v = q - la;
+                    double len = cv::norm(dl);
+                    r.push_back(lm.w * (len > 1e-9 ? (v.x * dl.y - v.y * dl.x) / len : cv::norm(v)));
+                }
+            };
+            side(Rji, lm.ai, lm.bi, lm.aj, lm.bj);
+            side(Rij, lm.aj, lm.bj, lm.ai, lm.bi);
         }
     }
     for (int i = 0; i < P.n; i++) {  // the gravity priors: tilt, and roll with half the weight (GCam: SensorResidual, RollPitchSensorResidual)
@@ -437,6 +552,32 @@ struct Piece {
     cv::Point tl;
     int src = 0;
 };
+
+/// Every pixel outside the mask takes the colour of the nearest pixel inside it (GCam's Expand): the blender's bands then
+/// never see the black beyond a photo's edge, which bled into the picture as bright and dark arcs along every seam.
+inline void fillOutside(Mat &img, const Mat &mask) {
+    Mat outside = mask == 0;
+    if (cv::countNonZero(outside) == 0 || cv::countNonZero(mask) == 0) return;
+    Mat dist, labels;
+    cv::distanceTransform(outside, dist, labels, cv::DIST_L2, 3, cv::DIST_LABEL_PIXEL);
+    std::vector<cv::Point> at(1);
+    for (int y = 0; y < img.rows; y++) {  // (each inside pixel's label is its own: the labels' positions)
+        const uchar *o = outside.ptr<uchar>(y);
+        const int *l = labels.ptr<int>(y);
+        for (int x = 0; x < img.cols; x++)
+            if (!o[x]) {
+                if ((int)at.size() <= l[x]) at.resize(l[x] + 1);
+                at[l[x]] = cv::Point(x, y);
+            }
+    }
+    for (int y = 0; y < img.rows; y++) {
+        const uchar *o = outside.ptr<uchar>(y);
+        const int *l = labels.ptr<int>(y);
+        cv::Vec3b *p = img.ptr<cv::Vec3b>(y);
+        for (int x = 0; x < img.cols; x++)
+            if (o[x] && l[x] > 0 && l[x] < (int)at.size()) p[x] = img.at<cv::Vec3b>(at[l[x]]);
+    }
+}
 
 /// Warps one photo onto the equirect canvas: its bounding box from its border (a pole inside it: the whole width), an
 /// inverse map over that box (each canvas pixel to a photo pixel), the photo sampled bilinearly, and the result cut into
@@ -523,6 +664,7 @@ void warpPhoto(const Mat &img, double f, double cx, double cy, const Matx33d &R,
     }
     Mat warped;
     cv::remap(img, warped, mapx, mapy, cv::INTER_LINEAR, cv::BORDER_CONSTANT);
+    fillOutside(warped, mask);
     auto piece = [&](int cx0, int cx1, int atx) {  // (columns [cx0, cx1) of the warped box, placed at canvas column atx)
         if (cx1 <= cx0) return;
         Piece p;
@@ -600,6 +742,78 @@ std::vector<double> matchExposure(const std::vector<Mat> &imgs, const std::vecto
     if (cv::solve(A, b, g, cv::DECOMP_SVD))
         for (int i = 0; i < n; i++) gammaOut[i] = std::max(1 / kGammaMax, std::min(kGammaMax, std::isfinite(g.at<double>(i)) ? g.at<double>(i) : 1.0));
     return gammaOut;
+}
+
+/// One gain per photo from the overlaps' mean luma (Brown and Lowe's gain compensation, solved in log space so large
+/// differences fit): sum N_ij (ln g_i - ln g_j - ln(L_ji / L_ij))^2, the mean log gain held at 0 (the sphere keeps the
+/// photos' overall brightness), clamped to [1/4, 4]. Applied in linear light.
+inline std::vector<double> matchGains(const std::vector<Mat> &imgs, const std::vector<Matx33d> &R, double f, double &maxRatio) {
+    int n = (int)imgs.size();
+    std::vector<std::vector<double>> sum(n, std::vector<double>(n, 0));
+    std::vector<std::vector<int>> cnt(n, std::vector<int>(n, 0));
+    const int rings = 39;
+    for (int k = 0; k < rings; k++) {
+        double lat = -kPi / 2 + (k + 0.5) * kPi / rings;
+        int m = std::max(1, (int)std::lround(2 * kPi * std::cos(lat) / 0.0792));
+        for (int t = 0; t < m; t++) {
+            double lon = (t + 0.5) * 2 * kPi / m - kPi;
+            Vec3d d(std::cos(lat) * std::sin(lon), -std::sin(lat), std::cos(lat) * std::cos(lon));
+            std::vector<std::pair<int, double>> hits;
+            for (int i = 0; i < n; i++) {
+                Vec3d c = R[i].t() * d;
+                if (c[2] <= 1e-6) continue;
+                double cx = (imgs[i].cols - 1) / 2.0, cy = (imgs[i].rows - 1) / 2.0;
+                int px = (int)std::lround(f * c[0] / c[2] + cx), py = (int)std::lround(f * c[1] / c[2] + cy);
+                if (px < 0 || py < 0 || px >= imgs[i].cols || py >= imgs[i].rows) continue;
+                cv::Vec3b p = imgs[i].at<cv::Vec3b>(py, px);
+                double l = (0.114 * p[0] + 0.5871 * p[1] + 0.2989 * p[2]) / 255.0;
+                hits.push_back({i, std::pow(std::max(l, 1e-3), 2.2)});  // (linear light)
+            }
+            for (auto &a : hits)
+                for (auto &b : hits)
+                    if (a.first != b.first) {
+                        sum[a.first][b.first] += a.second;
+                        cnt[a.first][b.first]++;
+                    }
+        }
+    }
+    Mat A = Mat::zeros(n, n, CV_64F), b = Mat::zeros(n, 1, CV_64F);
+    maxRatio = 1;
+    double totalN = 0;
+    for (int i = 0; i < n; i++)
+        for (int j = 0; j < n; j++) {
+            int N = cnt[i][j];
+            if (i == j || N <= 5 || cnt[j][i] <= 5) continue;
+            double Lij = sum[i][j] / N, Lji = sum[j][i] / cnt[j][i];
+            if (Lij < 1e-3 || Lji < 1e-3) continue;
+            double r = std::log(Lji / Lij);  // (ln g_i - ln g_j = r)
+            maxRatio = std::max(maxRatio, std::exp(std::fabs(r)));
+            A.at<double>(i, i) += N;
+            A.at<double>(i, j) -= N;
+            b.at<double>(i) += N * r;
+            totalN += N;
+        }
+    double prior = 1e-3 * std::max(1.0, totalN / n);  // (just enough to fix the overall level)
+    for (int i = 0; i < n; i++) A.at<double>(i, i) += prior;
+    Mat x;
+    std::vector<double> g(n, 1.0);
+    if (cv::solve(A, b, x, cv::DECOMP_SVD)) {
+        double mean = 0;
+        for (int i = 0; i < n; i++) mean += std::isfinite(x.at<double>(i)) ? x.at<double>(i) : 0;
+        mean /= n;
+        for (int i = 0; i < n; i++) {
+            double v = (std::isfinite(x.at<double>(i)) ? x.at<double>(i) : 0) - mean;
+            g[i] = std::exp(std::max(-std::log(4.0), std::min(std::log(4.0), v)));
+        }
+    }
+    return g;
+}
+
+inline void applyGain(Mat &img, double g) {
+    if (std::fabs(g - 1) < 1e-3) return;
+    Mat lut(1, 256, CV_8U);
+    for (int i = 0; i < 256; i++) lut.at<uchar>(i) = (uchar)std::lround(std::min(1.0, std::pow(std::pow(i / 255.0, 2.2) * g, 1 / 2.2)) * 255.0);
+    cv::LUT(img, lut, img);
 }
 
 void applyGamma(Mat &img, double g) {
@@ -692,6 +906,7 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
         cxm = (v.w - 1) / 2.0;
         cym = (v.h - 1) / 2.0;
         orb->detectAndCompute(gray, cv::noArray(), v.kps, v.desc);
+        v.lines = detectLines(gray);
         v.s16 = makeSmall(gray, fm, 0.0625);
         v.s8 = makeSmall(gray, fm, 0.125);
         v.s4 = makeSmall(gray, fm, 0.25);
@@ -766,7 +981,8 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
             matched[j].push_back(i);
         }
     }
-    int imagePairs = (int)pairs.size(), directPairs = 0;
+    int imagePairs = (int)pairs.size(), directPairs = 0, lineMatches = 0;
+    std::vector<LineMatch> lines;
     int keptPoints = 0;
     for (auto &p : pairs) keptPoints += (int)p.pi.size();
     // sensor pairs: a weak tie between each photo and the one before when no image match links them (GCam: SENSOR_PAIR,
@@ -820,9 +1036,18 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
         Matx33d G = rotY(yawOf(P.R0[0]) - yawOf(R[0]));
         for (auto &Ri : R) Ri = G * Ri;
 
-        // ---- plain walls: pairs the features left weak are aligned directly on the pixels from the adjusted rotations,
-        // and the result feeds a second adjustment as a grid of correspondences (GCam went to line features here)
+        // ---- plain walls: the photos' straight edges matched under the adjusted rotations (GCam's line features), and pairs
+        // the features left weak aligned directly on the pixels; both feed a second adjustment, then the lines once more
         report(0.56, "aligning plain walls");
+        auto matchAllLines = [&](const std::vector<Matx33d> &Rc) {
+            lines.clear();
+            for (int i = 0; i < n; i++)
+                for (int j = i + 1; j < n; j++)
+                    if (angleBetween(forwardOf(Rc[i]), forwardOf(Rc[j])) < 0.9 * fovLong)
+                        matchLines(i, j, views[i].lines, views[j].lines, Rc[j].t() * Rc[i], fm, cxm, cym, views[j].w, views[j].h, lines);
+            return (int)lines.size();
+        };
+        lineMatches = matchAllLines(R);
         int refined = 0;
         for (int i = 0; i < n; i++) {
             for (int j = i + 1; j < n; j++) {
@@ -859,10 +1084,11 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
                 }
             }
         }
-        if (refined > 0) {
+        for (int pass = 0; pass < 2 && (refined > 0 || lineMatches > 0); pass++) {
             BAProblem P2 = P;
             P2.R0 = R;
             P2.f0 = fAdj;
+            P2.lines = &lines;
             std::vector<Matx33d> R2;
             double f2 = fAdj;
             bundleAdjust(P2, R2, f2);
@@ -873,6 +1099,7 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
                 R = R2;
                 fAdj = f2;
             }
+            if (pass == 0) lineMatches = matchAllLines(R);  // (matched again from the better rotations, then adjusted once more)
         }
         directPairs = refined;
     } else {
@@ -889,12 +1116,13 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
     std::vector<Mat> smalls(n);
     for (int i = 0; i < n; i++) cv::resize(photos[i], smalls[i], cv::Size(), matchScale * 0.25, matchScale * 0.25, cv::INTER_AREA);
     std::vector<double> gammas;
-    matchExposure(smalls, R, fm * 0.25, gammas);
+    double maxRatio = 1;
+    gammas = matchGains(smalls, R, fm * 0.25, maxRatio);
     smalls.clear();
     for (int i = 0; i < n; i++) {
         Mat src = photos[i];
         if (composeScale < 0.999) cv::resize(photos[i], src, cv::Size(), composeScale, composeScale, cv::INTER_AREA);
-        applyGamma(src, gammas[i]);
+        applyGain(src, gammas[i]);
         double f = fFull * composeScale, cx = (src.cols - 1) / 2.0, cy = (src.rows - 1) / 2.0;
         size_t before = pieces.size();
         warpPhoto(src, f, cx, cy, R[i], eq, i, pieces);
@@ -1009,7 +1237,7 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
             gmax = std::max(gmax, g);
         }
         char buf[160];
-        snprintf(buf, sizeof buf, "gammas %.2f..%.2f, compose scale %.2f, %d pieces, %d bands", gmin, gmax, composeScale, np, bands);
+        snprintf(buf, sizeof buf, "gains %.2f..%.2f (overlaps differed up to %.2fx), %d line matches, compose scale %.2f, %d pieces, %d bands", gmin, gmax, maxRatio, lineMatches, composeScale, np, bands);
         res.notes = buf;
     }
     report(1.0, "done");
@@ -1160,6 +1388,17 @@ inline Synth generate(const std::string &dir, const std::vector<double> &yaws, c
             }
         }
         for (int x = 0; x < eq.W; x += eq.W / 64) cv::line(pano, cv::Point(x, (int)(eq.H * 0.72)), cv::Point(x + eq.W / 32, eq.H - 1), cv::Scalar(70, 105, 140), 1);  // (floorboards)
+        {  // (the faint texture of paint, and a few fixtures, as real ceilings and walls have)
+            Mat speck(pano.size(), CV_8SC3);
+            cv::randn(speck, 0, 3);
+            Mat top = pano(cv::Rect(0, 0, eq.W, (int)(eq.H * 0.72)));
+            cv::add(top, speck(cv::Rect(0, 0, eq.W, (int)(eq.H * 0.72))), top, cv::noArray(), CV_8UC3);
+            for (int k = 0; k < 6; k++) {
+                cv::Point c((int)(U(rng) * eq.W), (int)(eq.H * (0.03 + 0.14 * U(rng))));
+                cv::circle(pano, c, (int)(eq.W * (0.004 + 0.01 * U(rng))), cv::Scalar(200, 200, 205), -1, cv::LINE_AA);
+                cv::circle(pano, c, (int)(eq.W * (0.004 + 0.01 * U(rng))), cv::Scalar(150, 150, 150), 2, cv::LINE_AA);
+            }
+        }
         cv::line(pano, cv::Point(0, (int)(eq.H * 0.22)), cv::Point(eq.W - 1, (int)(eq.H * 0.22)), cv::Scalar(150, 150, 150), 2);
         cv::line(pano, cv::Point(0, (int)(eq.H * 0.72)), cv::Point(eq.W - 1, (int)(eq.H * 0.72)), cv::Scalar(90, 90, 90), 3);
         for (int k = 0; k < 28; k++) {  // (pictures, a door, a window, switches: the few things to match)
