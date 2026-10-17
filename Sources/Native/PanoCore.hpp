@@ -79,7 +79,7 @@ constexpr double kLatGateDeg = 9.0;
 constexpr double kCycleDeg = 4.0;        // without a gyro, a pair is believed when a third photo closes the triangle within this
 constexpr int kStrongEdge = 40;          // ...or when it has this many inliers on its own
 constexpr double kSupportPx = 25.0;
-constexpr double kFocalPriorPx = 300.0;  // the focal stays near the lens's: this many match pixels per unit of ln(f / f0)
+constexpr double kFocalPriorPx = 3000.0; // the focal stays near the lens's (exact on an iPhone): this many match pixels per unit of ln(f / f0)
 constexpr double kPriorAgreeDeg = 10.0;  // without a gyro, a pair must agree with the verified placement within this      // ...and a photo stays when one of its matches holds within this after the adjustment
 constexpr double kGammaMax = 2.5;        // a photo's gamma at most (GCam: 1.75; an iPhone's auto exposure spans more)      // and a match's two rays must lie within this latitude band (GCam: 6 deg bins +-1)
 
@@ -1464,35 +1464,49 @@ inline Bootstrap bootstrap(const std::vector<std::string> &paths, double focalPx
         char buf[200];
         for (int a : nb) {
             double yaw0 = yawOf(R[a]), pitch0 = pitchOf(R[a]), roll0 = rollOf(R[a]);
-            double bestC = -1;
-            Matx33d bestRak;
-            for (int iy = -15; iy <= 15; iy++)
-                for (int ip = -8; ip <= 8; ip++) {
-                    double pitch = std::max(-kPi / 2, std::min(kPi / 2, pitch0 + rad(6 * ip)));
-                    Matx33d Rk = lookAt(yaw0 + rad(6 * iy), pitch, roll0), Rak = R[a].t() * Rk;
-                    int inside;
-                    double c = correlation(s16[k], s16[a], Rak, inside);
-                    if (c > bestC) {
-                        bestC = c;
-                        bestRak = Rak;
-                    }
+            double bestC = -1, bestYaw = yaw0, bestPitch = pitch0, bestRoll = roll0;
+            auto tryPose = [&](const Small &sk, const Small &sa, double yaw, double pitch, double roll) {
+                pitch = std::max(-kPi / 2, std::min(kPi / 2, pitch));
+                Matx33d Rak = R[a].t() * lookAt(yaw, pitch, roll);
+                int inside;
+                double c = correlation(sk, sa, Rak, inside);
+                if (c > bestC) {
+                    bestC = c;
+                    bestYaw = yaw;
+                    bestPitch = pitch;
+                    bestRoll = roll;
                 }
-            snprintf(buf, sizeof buf, "#%d via #%d: corr %.2f", k, a, bestC);
+            };
+            for (int iy = -15; iy <= 15; iy++)  // coarse: yaw and pitch at 1/16, the neighbour's roll
+                for (int ip = -8; ip <= 8; ip++) tryPose(s16[k], s16[a], yaw0 + rad(6 * iy), pitch0 + rad(6 * ip), roll0);
+            double c16 = bestC;
+            snprintf(buf, sizeof buf, "#%d via #%d: corr %.2f", k, a, c16);
             out.log += buf;
-            if (bestC < 0.3) {
+            if (c16 < 0.3) {
                 out.log += " (too low); ";
                 continue;
             }
-            Matx33d Rak = bestRak;
-            double before, after;
-            int pts, inside;
-            int level = 0;
-            bool fine = refineDirect(s16[k], s16[a], Rak, before, after, pts) && ++level && refineDirect(s8[k], s8[a], Rak, before, after, pts) && ++level &&
-                        refineDirect(s4[k], s4[a], Rak, before, after, pts) && ++level;
+            double y1 = bestYaw, p1 = bestPitch, r1 = bestRoll;  // fine: with roll, at 1/8
+            bestC = -1;
+            for (int iy = -4; iy <= 4; iy++)
+                for (int ip = -4; ip <= 4; ip++)
+                    for (int ir = -3; ir <= 3; ir++) tryPose(s8[k], s8[a], y1 + rad(1.5 * iy), p1 + rad(1.5 * ip), r1 + rad(3 * ir));
+            Matx33d Rak = R[a].t() * lookAt(bestYaw, bestPitch, bestRoll);
+            int level = 0, pts = 0, inside = 0;
+            double before = 0, after = 0;
+            for (int lv = 0; lv < 2; lv++) {  // the tracker's refinement at 1/8 and 1/4, kept when it lowered the error
+                const Small &sk = lv == 0 ? s8[k] : s4[k], &sa = lv == 0 ? s8[a] : s4[a];
+                Matx33d trial = Rak;
+                bool fine = refineDirect(sk, sa, trial, before, after, pts);
+                if (fine || (pts >= 150 && after < before)) {
+                    Rak = trial;
+                    level++;
+                }
+            }
             double c = correlation(s4[k], s4[a], Rak, inside);
-            snprintf(buf, sizeof buf, ", refined %d/3 (%.0f->%.0f, %d pts), corr %.2f at 1/4; ", level, before, after, pts, c);
+            snprintf(buf, sizeof buf, ", fine %.2f, refined %d/2 (%.0f->%.0f, %d pts), corr %.2f at 1/4; ", bestC, level, before, after, pts, c);
             out.log += buf;
-            if (fine && c > 0.5) found.push_back({R[a] * Rak, c});
+            if (c >= 0.6) found.push_back({R[a] * Rak, c});
         }
         bool ok = false;
         Matx33d Rk;
@@ -1500,9 +1514,11 @@ inline Bootstrap bootstrap(const std::vector<std::string> &paths, double focalPx
             ok = true;
             Rk = found[0].second >= found[1].second ? found[0].first : found[1].first;
         } else {
+            double bestC = 0.8;  // (one neighbour alone must correlate strongly)
             for (auto &f : found)
-                if (f.second > 0.75 && (!ok || f.second > 0)) {
+                if (f.second >= bestC) {
                     ok = true;
+                    bestC = f.second;
                     Rk = f.first;
                 }
         }
