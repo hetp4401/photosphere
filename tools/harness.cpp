@@ -96,7 +96,8 @@ int main(int argc, char **argv) {
             auto t0 = std::chrono::steady_clock::now();
             pano::Bootstrap b = pano::bootstrap(paths, focal, show);
             double bs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-            printf("bootstrap: placed %zu of %zu, %d matched pairs (%d rejected), root %d, %.0f s; not placed:", b.placed.size(), paths.size(), b.edges, b.rejected, b.root, bs);
+            printf("bootstrap: placed %zu of %zu (%d by the pixels), %d matched pairs (%d rejected), root %d, %.0f s; not placed:", b.placed.size(), paths.size(), b.secondChance, b.edges,
+                   b.rejected, b.root, bs);
             for (size_t i = 0; i < paths.size(); i++)
                 if (std::find(b.placed.begin(), b.placed.end(), (int)i) == b.placed.end()) printf(" %s", paths[i].substr(paths[i].rfind('/') + 1).c_str());
             printf("\n");

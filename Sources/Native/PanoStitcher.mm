@@ -93,7 +93,7 @@ NSError *err(const std::string &msg) {
         if (b.placed.empty()) return nil;
         NSMutableArray *idx = [NSMutableArray array];
         for (int i : b.placed) [idx addObject:@(i)];
-        return @{@"placed" : idx, @"rotations" : arraysFrom(b.R), @"edges" : @(b.edges), @"rejected" : @(b.rejected), @"root" : @(b.root)};
+        return @{@"placed" : idx, @"rotations" : arraysFrom(b.R), @"edges" : @(b.edges), @"rejected" : @(b.rejected), @"secondChance" : @(b.secondChance), @"root" : @(b.root)};
     } catch (const std::exception &) {
         return nil;
     }

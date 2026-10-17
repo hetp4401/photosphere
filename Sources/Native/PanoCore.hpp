@@ -38,7 +38,7 @@ struct StitchResult {
 struct Bootstrap {
     std::vector<int> placed;
     std::vector<Matx33d> R;
-    int edges = 0, rejected = 0, root = -1;
+    int edges = 0, rejected = 0, secondChance = 0, root = -1;
 };
 
 struct Synth {
@@ -77,7 +77,9 @@ constexpr double kAxesNear = 0.9;        // two photos are candidates when their
 constexpr double kLatGateDeg = 9.0;
 constexpr double kCycleDeg = 4.0;        // without a gyro, a pair is believed when a third photo closes the triangle within this
 constexpr int kStrongEdge = 40;          // ...or when it has this many inliers on its own
-constexpr double kSupportPx = 25.0;      // ...and a photo stays when one of its matches holds within this after the adjustment
+constexpr double kSupportPx = 25.0;
+constexpr double kFocalPriorPx = 300.0;  // the focal stays near the lens's: this many match pixels per unit of ln(f / f0)
+constexpr double kPriorAgreeDeg = 10.0;  // without a gyro, a pair must agree with the verified placement within this      // ...and a photo stays when one of its matches holds within this after the adjustment
 constexpr double kGammaMax = 2.5;        // a photo's gamma at most (GCam: 1.75; an iPhone's auto exposure spans more)      // and a match's two rays must lie within this latitude band (GCam: 6 deg bins +-1)
 
 double deg(double r) { return r * 180.0 / kPi; }
@@ -312,7 +314,7 @@ inline void matchLines(int i, int j, const std::vector<LineSeg> &li, const std::
         return q.x > -0.2 * wj && q.y > -0.2 * hj && q.x < 1.2 * wj && q.y < 1.2 * hj;
     };
     std::vector<int> bestFor(li.size(), -1), bestBack(lj.size(), -1);
-    std::vector<double> bestScore(li.size(), 1e9), bestBackScore(lj.size(), 1e9);
+    std::vector<double> bestScore(li.size(), 1e9), bestBackScore(lj.size(), 1e9), secondScore(li.size(), 1e9);
     for (size_t s = 0; s < li.size(); s++) {
         Point2d qa, qb;
         if (!transfer(li[s].a, qa) || !transfer(li[s].b, qb)) continue;
@@ -332,8 +334,11 @@ inline void matchLines(int i, int j, const std::vector<LineSeg> &li, const std::
             if (hi - lo < 0.3 * std::min(lq, lj[t].len)) continue;
             double score = d1 + d2;
             if (score < bestScore[s]) {
+                secondScore[s] = bestScore[s];
                 bestScore[s] = score;
                 bestFor[s] = (int)t;
+            } else if (score < secondScore[s]) {
+                secondScore[s] = score;
             }
             if (score < bestBackScore[t]) {
                 bestBackScore[t] = score;
@@ -343,7 +348,7 @@ inline void matchLines(int i, int j, const std::vector<LineSeg> &li, const std::
     }
     std::vector<std::pair<double, int>> order;
     for (size_t s = 0; s < li.size(); s++)
-        if (bestFor[s] >= 0 && bestBack[bestFor[s]] == (int)s) order.push_back({bestScore[s], (int)s});
+        if (bestFor[s] >= 0 && bestBack[bestFor[s]] == (int)s && bestScore[s] < 0.6 * secondScore[s]) order.push_back({bestScore[s], (int)s});
     std::sort(order.begin(), order.end());
     for (size_t k = 0; k < order.size() && (int)k < cap; k++) {
         int s = order[k].second, t = bestFor[s];
@@ -481,6 +486,7 @@ void baResiduals(const BAProblem &P, const std::vector<double> &x, std::vector<d
             side(Rij, lm.j, lm.i, lm.aj, lm.bj, lm.ai, lm.bi);
         }
     }
+    r.push_back(kFocalPriorPx * x[3 * P.n]);  // (the focal stays near the lens's own value)
     for (int i = 0; i < P.n; i++) {  // the gravity priors: tilt, and roll with half the weight (GCam: SensorResidual, RollPitchSensorResidual)
         r.push_back(P.ws * f * (pitchOf(R[i]) - P.pitch0[i]));
         r.push_back(std::fabs(P.pitch0[i]) < rad(81) ? 0.5 * P.ws * f * (rollOf(R[i]) - P.roll0[i]) : 0.0);
@@ -984,6 +990,7 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
             std::vector<int> inl;
             if (!ransacRotation(ra, rb, rng, Rvis, inl)) continue;
             if ((int)inl.size() <= 5 + 0.15 * (int)ra.size()) continue;  // (INLIER_FAIL)
+            if (!sensors && ((int)inl.size() < 12 || angleOf(Rvis * (b.Rp.t() * a.Rp).t()) > rad(kPriorAgreeDeg))) continue;  // (a chance match)
             if (sensors) {
                 Matx33d Rsens = b.Rp.t() * a.Rp, E = Rvis * Rsens.t();
                 double yawTol = rad(std::min(25.0 * (j - i), 65.0));
@@ -1080,7 +1087,7 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
                 best[pm.i] = std::min(best[pm.i], med);
                 best[pm.j] = std::min(best[pm.j], med);
             }
-            for (int i = 0; i < n; i++) dead[i] = best[i] > kSupportPx;
+            for (int i = 0; i < n; i++) dead[i] = best[i] < 1e9 && best[i] > kSupportPx;
             std::vector<PairMatch> alive;
             for (auto &pm : pairs)
                 if (!dead[pm.i] && !dead[pm.j]) alive.push_back(pm);
@@ -1332,6 +1339,7 @@ inline Bootstrap bootstrap(const std::vector<std::string> &paths, double focalPx
         std::vector<Vec3d> rays;
     };
     std::vector<F> fs(n);
+    std::vector<Small> s16(n), s8(n), s4(n);
     double fm = focalPx, cx = 0, cy = 0;
     for (int i = 0; i < n; i++) {
         Mat img = cv::imread(paths[i], cv::IMREAD_GRAYSCALE);
@@ -1342,6 +1350,9 @@ inline Bootstrap bootstrap(const std::vector<std::string> &paths, double focalPx
         cv::resize(img, gray, cv::Size(), scale, scale, cv::INTER_AREA);
         cx = (gray.cols - 1) / 2.0;
         cy = (gray.rows - 1) / 2.0;
+        s16[i] = makeSmall(gray, fm, 0.0625);
+        s8[i] = makeSmall(gray, fm, 0.125);
+        s4[i] = makeSmall(gray, fm, 0.25);
         orb->detectAndCompute(gray, cv::noArray(), fs[i].kps, fs[i].desc);
         for (auto &k : fs[i].kps) fs[i].rays.push_back(rayOf(k.pt.x, k.pt.y, fm, cx, cy));
         report(0.4 * (i + 1) / n, "finding features");
@@ -1428,6 +1439,96 @@ inline Bootstrap bootstrap(const std::vector<std::string> &paths, double focalPx
         placed[fromI ? best->j : best->i] = true;
         placedCount++;
     }
+    // ---- second chance: a photo no triangle vouched for is tried where its neighbours in time put it. From each of the
+    // nearest placed photos before and after it: a search over yaw and pitch of the whole overlap at 1/16 scale by
+    // correlation (a plain overlap scores nothing), then the tracker's refinement up to 1/4 scale. It is placed when
+    // both neighbours agree within 3 deg, or one correlates strongly. (GCam had the gyro for this.)
+    auto correlation = [&](const Small &k, const Small &a, const Matx33d &Rak, int &inside) {
+        double sk = 0, sa = 0, skk = 0, saa = 0, ska = 0;
+        int total = 0;
+        inside = 0;
+        for (int y = 2; y < k.g.rows - 2; y += 2)
+            for (int x = 2; x < k.g.cols - 2; x += 2) {
+                total++;
+                Vec3d d = Rak * Vec3d((x - k.cx) / k.f, (y - k.cy) / k.f, 1);
+                if (d[2] <= 0.1) continue;
+                double qx = a.f * d[0] / d[2] + a.cx, qy = a.f * d[1] / d[2] + a.cy;
+                if (qx < 1 || qy < 1 || qx >= a.g.cols - 2 || qy >= a.g.rows - 2) continue;
+                double vk = k.g.at<float>(y, x), va = bilinear(a.g, qx, qy);
+                sk += vk;
+                sa += va;
+                skk += vk * vk;
+                saa += va * va;
+                ska += vk * va;
+                inside++;
+            }
+        if (inside < 0.15 * total || inside < 60) return -1.0;
+        double mk = sk / inside, ma = sa / inside;
+        double vk = skk / inside - mk * mk, va = saa / inside - ma * ma;
+        if (vk < 64 || va < 64) return -1.0;  // (plain: nothing to correlate)
+        return (ska / inside - mk * ma) / std::sqrt(vk * va);
+    };
+    int secondChance = 0;
+    for (int k = 0; k < n; k++) {
+        if (placed[k]) continue;
+        std::vector<int> nb;
+        for (int d = 1; d <= 3; d++) {
+            if (k - d >= 0 && placed[k - d]) {
+                nb.push_back(k - d);
+                break;
+            }
+        }
+        for (int d = 1; d <= 3; d++) {
+            if (k + d < n && placed[k + d]) {
+                nb.push_back(k + d);
+                break;
+            }
+        }
+        std::vector<std::pair<Matx33d, double>> found;  // (world-from-camera, correlation at 1/4)
+        for (int a : nb) {
+            double yaw0 = yawOf(R[a]), pitch0 = pitchOf(R[a]), roll0 = rollOf(R[a]);
+            double bestC = -1;
+            Matx33d bestRak;
+            for (int iy = -10; iy <= 10; iy++)
+                for (int ip = -7; ip <= 7; ip++) {
+                    double pitch = std::max(-kPi / 2, std::min(kPi / 2, pitch0 + rad(6 * ip)));
+                    Matx33d Rk = lookAt(yaw0 + rad(6 * iy), pitch, roll0), Rak = R[a].t() * Rk;
+                    int inside;
+                    double c = correlation(s16[k], s16[a], Rak, inside);
+                    if (c > bestC) {
+                        bestC = c;
+                        bestRak = Rak;
+                    }
+                }
+            if (bestC < 0.3) continue;
+            Matx33d Rak = bestRak;
+            double before, after;
+            int pts, inside;
+            if (!refineDirect(s16[k], s16[a], Rak, before, after, pts)) continue;
+            if (!refineDirect(s8[k], s8[a], Rak, before, after, pts)) continue;
+            if (!refineDirect(s4[k], s4[a], Rak, before, after, pts)) continue;
+            double c = correlation(s4[k], s4[a], Rak, inside);
+            if (c > 0.5) found.push_back({R[a] * Rak, c});
+        }
+        bool ok = false;
+        Matx33d Rk;
+        if (found.size() == 2 && angleOf(found[0].first * found[1].first.t()) < rad(3)) {
+            ok = true;
+            Rk = found[0].second >= found[1].second ? found[0].first : found[1].first;
+        } else {
+            for (auto &f : found)
+                if (f.second > 0.75 && (!ok || f.second > 0)) {
+                    ok = true;
+                    Rk = f.first;
+                }
+        }
+        if (ok) {
+            R[k] = Rk;
+            placed[k] = true;
+            secondChance++;
+        }
+    }
+    out.secondChance = secondChance;
     // "up": perpendicular to every placed photo's right vector; the world's y points down, z along the root's forward
     Mat Mx = Mat::zeros(3, 3, CV_64F);
     for (int i = 0; i < n; i++) {

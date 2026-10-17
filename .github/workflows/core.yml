@@ -45,7 +45,9 @@ jobs:
         if: always()
         with:
           name: core-synthetic
-          path: out/*.jpg
+          path: |
+            out/*.jpg
+            out/*/pairs.txt
           if-no-files-found: ignore
       - uses: actions/upload-artifact@v4
         if: always()
