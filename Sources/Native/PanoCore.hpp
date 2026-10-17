@@ -1008,9 +1008,10 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
             if (!sensors && ((int)inl.size() < 12 || angleOf(Rvis * (b.Rp.t() * a.Rp).t()) > rad(kPriorAgreeDeg))) continue;  // (a chance match)
             if (sensors) {
                 Matx33d Rsens = b.Rp.t() * a.Rp, E = Rvis * Rsens.t();
-                double yawTol = rad(std::min(25.0 * (j - i), 65.0));
+                // (a phone's gyro is good to a few degrees between neighbours and drifts with the gap; GCam allowed 25 deg a step)
+                double tol = rad(std::min(6.0 + 0.5 * (j - i), 25.0));
                 Vec3d upj = b.Rp.t() * Vec3d(0, -1, 0);
-                if (angleOf(E) > yawTol || angleBetween(E * upj, upj) > rad(12.5)) continue;  // (GEO_FAIL: not what the sensors say)
+                if (angleOf(E) > tol || angleBetween(E * upj, upj) > rad(12.5)) continue;  // (GEO_FAIL: not what the sensors say)
             }
             std::vector<cv::KeyPoint> kpsA;
             for (int k : inl) kpsA.push_back(a.kps[ka[k]]);
@@ -1036,7 +1037,7 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
             matched[j].push_back(i);
         }
     }
-    int imagePairs = (int)pairs.size(), directPairs = 0, lineMatches = 0;
+    int imagePairs = (int)pairs.size(), directPairs = 0, lineMatches = 0, rejectedPairs = 0;
     std::vector<LineMatch> lines;
     int keptPoints = 0;
     for (auto &p : pairs) keptPoints += (int)p.pi.size();
@@ -1092,6 +1093,37 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
         }
         Matx33d G = rotY(yawOf(P.R0[0]) - yawOf(R[0]));
         for (auto &Ri : R) Ri = G * Ri;
+
+        // ---- a pair the adjustment could not satisfy (a wrong match that passed every check) is dropped, and it runs again
+        {
+            std::vector<double> meds;
+            for (auto &pm : pairs)
+                if (!pm.sensor) meds.push_back(medianResidual(pm, R, fAdj, P.cxs, P.cys));
+            if (meds.size() >= 4) {
+                std::vector<double> sorted = meds;
+                std::nth_element(sorted.begin(), sorted.begin() + sorted.size() / 2, sorted.end());
+                double limit = std::max(20.0, 4 * sorted[sorted.size() / 2]);
+                std::vector<PairMatch> kept;
+                size_t k = 0;
+                for (auto &pm : pairs) {
+                    if (pm.sensor || meds[k++] <= limit) kept.push_back(pm);
+                    else rejectedPairs++;
+                }
+                if (rejectedPairs > 0) {
+                    pairs.swap(kept);
+                    std::vector<Matx33d> R2;
+                    double f2 = fAdj;
+                    bundleAdjust(P, R2, f2);
+                    double fov2 = deg(2 * std::atan(std::max(views[0].w, views[0].h) / 2.0 / f2));
+                    if (fov2 > 10 && fov2 < 150 && std::isfinite(f2)) {
+                        Matx33d G2 = rotY(yawOf(P.R0[0]) - yawOf(R2[0]));
+                        for (auto &Ri : R2) Ri = G2 * Ri;
+                        R = R2;
+                        fAdj = f2;
+                    }
+                }
+            }
+        }
 
         // ---- without a gyro, a photo stays only when one of its matches holds under the adjusted rotations (a gyro held
         // every photo for GCam); the others are dropped rather than painted where a chance match put them
@@ -1358,8 +1390,8 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
             gmax = std::max(gmax, gammas[i]);
         }
         char buf[200];
-        snprintf(buf, sizeof buf, "gains %.2f..%.2f (overlaps differed up to %.2fx), %d line matches, %d dropped, compose scale %.2f, %d pieces, %d bands", gmin, gmax, maxRatio,
-                 lineMatches, (int)res.dropped.size(), composeScale, np, bands);
+        snprintf(buf, sizeof buf, "gains %.2f..%.2f (overlaps differed up to %.2fx), %d line matches, %d pairs rejected, %d dropped, compose scale %.2f, %d pieces, %d bands",
+                 gmin, gmax, maxRatio, lineMatches, rejectedPairs, (int)res.dropped.size(), composeScale, np, bands);
         res.notes = buf;
     }
     report(1.0, "done");
