@@ -37,47 +37,58 @@ final class SelfTestModel: ObservableObject {
         let tm = TargetManager(hfov: hfovDeg * .pi / 180, vfov: vfovDeg * .pi / 180)
         let yaws = tm.targets.map { NSNumber(value: $0.yaw) }, pitches = tm.targets.map { NSNumber(value: $0.pitch) }
         Task.detached(priority: .userInitiated) {
-            guard let gen = PanoStitcher.selfTestGenerate(inDirectory: dir, yaws: yaws, pitches: pitches, fovDeg: self.hfovDeg, width: 1600, height: 1200, panoWidth: 4096),
-                  let paths = gen["images"] as? [String], let priors = gen["rotations"] as? [[NSNumber]], let truth = gen["truth"] as? [[NSNumber]],
-                  let focal = gen["focalPx"] as? Double, let truthPano = gen["pano"] as? String else {
-                await MainActor.run { self.status = "generation failed" }
-                return
-            }
-            let thumbs = paths.map { CaptureSession.upright(UIImage(contentsOfFile: $0) ?? UIImage(), maxSide: 400) }
-            await MainActor.run {
-                self.images = zip(thumbs, priors).map { ($0, Orient.matrix($1.map { $0.doubleValue })) }
-                self.status = "\(paths.count) synthetic photos, stitching"
-            }
-            let args = CommandLine.arguments
-            if let i = args.firstIndex(of: "-mosaicseconds"), i + 1 < args.count, let secs = Double(args[i + 1]) {
-                try? await Task.sleep(nanoseconds: UInt64(secs * 1e9))
-            }
-            do {
-                let raw = (dir as NSString).appendingPathComponent("result.jpg")
-                let res = try PanoStitcher.stitchImages(paths, rotations: priors, focalPx: focal, outputWidth: 4096, outputPath: raw) { f, s in
-                    Task { @MainActor in self.status = String(format: "%@ %.0f%%", s, f * 100) }
+            var lines: [String] = []
+            var allPass = true
+            var lastOut: URL?
+            for world in ["textured", "room"] {  // (shapes everywhere, then a plain room: the hard case)
+                let wdir = (dir as NSString).appendingPathComponent(world)
+                guard let gen = PanoStitcher.selfTestGenerate(inDirectory: wdir, yaws: yaws, pitches: pitches, fovDeg: self.hfovDeg, width: 1600, height: 1200, panoWidth: 4096, world: world),
+                      let paths = gen["images"] as? [String], let priors = gen["rotations"] as? [[NSNumber]], let truth = gen["truth"] as? [[NSNumber]],
+                      let focal = gen["focalPx"] as? Double, let truthPano = gen["pano"] as? String else {
+                    lines.append("SELFTEST \(world) generation failed FAIL")
+                    allPass = false
+                    continue
                 }
-                let metrics = PanoStitcher.selfTestMetrics(for: res, truthPano: truthPano, truthRotations: truth)
-                let rms = (metrics["rotationRmsDeg"] as? Double) ?? 99, worst = (metrics["rotationMaxDeg"] as? Double) ?? 99
-                let psnr = (metrics["psnr"] as? Double) ?? 0, pass = (metrics["pass"] as? Bool) ?? false
-                let line = String(format: "SELFTEST photos=%d pairs=%d rotRMS=%.3f deg rotMax=%.3f deg psnr=%.2f dB crop=%dx%d of %dx%d full=%d seconds=%.1f %@",
-                                  res.imagesUsed, res.pairsMatched, rms, worst, psnr, res.cropWidth, res.cropHeight, res.fullWidth, res.fullHeight,
-                                  res.fullCircle ? 1 : 0, res.seconds, pass ? "PASS" : "FAIL")
-                let packet = XMP.gpanoPacket(fullWidth: Int(res.fullWidth), fullHeight: Int(res.fullHeight), cropWidth: Int(res.cropWidth), cropHeight: Int(res.cropHeight),
-                                             left: Int(res.cropLeft), top: Int(res.cropTop), headingDeg: 0, firstDate: Date(), lastDate: Date(), sourceCount: paths.count, usePanoramaViewer: true)
-                let data = XMP.embed(packet: packet, in: try Data(contentsOf: URL(fileURLWithPath: raw)))
-                let out = CaptureSession.panoramasDir.appendingPathComponent("selftest.jpg")
-                try data.write(to: out, options: .atomic)
-                try line.write(to: CaptureSession.documents.appendingPathComponent("selftest.txt"), atomically: true, encoding: .utf8)
-                print(line)
+                let thumbs = paths.map { CaptureSession.upright(UIImage(contentsOfFile: $0) ?? UIImage(), maxSide: 400) }
                 await MainActor.run {
-                    self.status = line
-                    self.panoURL = out
+                    self.images = zip(thumbs, priors).map { ($0, Orient.matrix($1.map { $0.doubleValue })) }
+                    self.status = "\(world): \(paths.count) synthetic photos, stitching"
                 }
-            } catch {
-                let line = "SELFTEST error: \(error.localizedDescription) FAIL"
-                try? line.write(to: CaptureSession.documents.appendingPathComponent("selftest.txt"), atomically: true, encoding: .utf8)
-                await MainActor.run { self.status = line }
+                let args = CommandLine.arguments
+                if world == "textured", let i = args.firstIndex(of: "-mosaicseconds"), i + 1 < args.count, let secs = Double(args[i + 1]) {
+                    try? await Task.sleep(nanoseconds: UInt64(secs * 1e9))
+                }
+                do {
+                    let raw = (wdir as NSString).appendingPathComponent("result.jpg")
+                    let res = try PanoStitcher.stitchImages(paths, rotations: priors, focalPx: focal, outputWidth: 4096, outputPath: raw) { f, s in
+                        Task { @MainActor in self.status = String(format: "%@: %@ %.0f%%", world, s, f * 100) }
+                    }
+                    let metrics = PanoStitcher.selfTestMetrics(for: res, truthPano: truthPano, truthRotations: truth)
+                    let rms = (metrics["rotationRmsDeg"] as? Double) ?? 99, worst = (metrics["rotationMaxDeg"] as? Double) ?? 99
+                    let psnr = (metrics["psnr"] as? Double) ?? 0, pass = (metrics["pass"] as? Bool) ?? false
+                    allPass = allPass && pass
+                    let line = String(format: "SELFTEST %@ photos=%d pairs=%d rotRMS=%.3f deg rotMax=%.3f deg psnr=%.2f dB crop=%dx%d of %dx%d full=%d seconds=%.1f %@",
+                                      world, res.imagesUsed, res.pairsMatched, rms, worst, psnr, res.cropWidth, res.cropHeight, res.fullWidth, res.fullHeight,
+                                      res.fullCircle ? 1 : 0, res.seconds, pass ? "PASS" : "FAIL")
+                    let packet = XMP.gpanoPacket(fullWidth: Int(res.fullWidth), fullHeight: Int(res.fullHeight), cropWidth: Int(res.cropWidth), cropHeight: Int(res.cropHeight),
+                                                 left: Int(res.cropLeft), top: Int(res.cropTop), headingDeg: 0, firstDate: Date(), lastDate: Date(), sourceCount: paths.count, usePanoramaViewer: true)
+                    let data = XMP.embed(packet: packet, in: try Data(contentsOf: URL(fileURLWithPath: raw)))
+                    let out = CaptureSession.panoramasDir.appendingPathComponent("selftest-\(world).jpg")
+                    try data.write(to: out, options: .atomic)
+                    lastOut = out
+                    lines.append(line)
+                    print(line)
+                } catch {
+                    lines.append("SELFTEST \(world) error: \(error.localizedDescription) FAIL")
+                    allPass = false
+                }
+            }
+            lines.append(allPass ? "SELFTEST ALL PASS" : "SELFTEST SOME FAILED")
+            let text = lines.joined(separator: "\n")
+            try? text.write(to: CaptureSession.documents.appendingPathComponent("selftest.txt"), atomically: true, encoding: .utf8)
+            await MainActor.run {
+                self.status = text
+                self.panoURL = lastOut
             }
         }
     }

@@ -104,9 +104,109 @@ Matx33d kabsch(const std::vector<Vec3d> &a, const std::vector<Vec3d> &b, const s
 
 // ---------------------------------------------------------------- features and pairwise rotations
 
+/// A photo shrunk and normalised for the direct alignment (GCam's AlignmentTracker normalised its levels the same way:
+/// 128 + 128 (I - mean) / (2 sd), so exposure doesn't matter).
+struct Small {
+    Mat g, gx, gy;
+    double f = 1, cx = 0, cy = 0;
+};
+
+Small makeSmall(const Mat &gray, double f, double scale) {
+    Small s;
+    cv::resize(gray, s.g, cv::Size(), scale, scale, cv::INTER_AREA);
+    s.g.convertTo(s.g, CV_32F);
+    cv::Scalar mu, sd;
+    cv::meanStdDev(s.g, mu, sd);
+    s.g = (s.g - mu[0]) * (128.0 / (2 * std::max(1.0, sd[0]))) + 128;
+    cv::GaussianBlur(s.g, s.g, cv::Size(3, 3), 0);
+    cv::Sobel(s.g, s.gx, CV_32F, 1, 0, 3, 1 / 8.0);
+    cv::Sobel(s.g, s.gy, CV_32F, 0, 1, 3, 1 / 8.0);
+    s.f = f * scale;
+    s.cx = (s.g.cols - 1) / 2.0;
+    s.cy = (s.g.rows - 1) / 2.0;
+    return s;
+}
+
+float bilinear(const Mat &g, double x, double y) {
+    int x0 = (int)x, y0 = (int)y;
+    double fx = x - x0, fy = y - y0;
+    const float *r0 = g.ptr<float>(y0), *r1 = g.ptr<float>(y0 + 1);
+    return (float)((r0[x0] * (1 - fx) + r0[x0 + 1] * fx) * (1 - fy) + (r1[x0] * (1 - fx) + r1[x0 + 1] * fx) * fy);
+}
+
+/// Refines the rotation taking camera a's rays to camera b's directly on the pixels (GCam's CameraRotationModel /
+/// GlobalFlowSolver, Gauss-Newton on brightness differences): the pixels of a with some gradient are transferred into
+/// b, and the brightness difference, with b's gradients, is solved for a small rotation (and an affine brightness
+/// change), repeated until it settles. true when the fit improved clearly; before/after: the mean |difference|.
+bool refineDirect(const Small &a, const Small &b, Matx33d &Rji, double &before, double &after, int &points) {
+    std::vector<cv::Point> pts;
+    for (int y = 2; y < a.g.rows - 2; y += 2)
+        for (int x = 2; x < a.g.cols - 2; x += 2)
+            if (std::fabs(a.gx.at<float>(y, x)) + std::fabs(a.gy.at<float>(y, x)) > 3) pts.push_back(cv::Point(x, y));
+    if (pts.size() > 3000) {
+        std::mt19937 rng(3);
+        std::shuffle(pts.begin(), pts.end(), rng);
+        pts.resize(3000);
+    }
+    Matx33d R0 = Rji;
+    double alpha = 1, beta = 0;
+    before = after = 0;
+    points = 0;
+    for (int it = 0; it < 25; it++) {
+        Mat A = Mat::zeros(5, 5, CV_64F), rhs = Mat::zeros(5, 1, CV_64F);
+        double sumAbs = 0;
+        int used = 0;
+        for (auto &p : pts) {
+            Vec3d d = Rji * Vec3d((p.x - a.cx) / a.f, (p.y - a.cy) / a.f, 1);
+            if (d[2] <= 0.1) continue;
+            double qx = b.f * d[0] / d[2] + b.cx, qy = b.f * d[1] / d[2] + b.cy;
+            if (qx < 1 || qy < 1 || qx >= b.g.cols - 2 || qy >= b.g.rows - 2) continue;
+            double Ib = bilinear(b.g, qx, qy), Ia = a.g.at<float>(p.y, p.x);
+            double gbx = bilinear(b.gx, qx, qy), gby = bilinear(b.gy, qx, qy);
+            double e = Ib - (alpha * Ia + beta);
+            // dq/dw: q = f d.xy/d.z + c, d = exp(w) d0 ~ d0 + w x d0 = d0 - [d0]x w
+            double s = b.f / d[2];
+            double Jd[2][3] = {{s, 0, -s * d[0] / d[2]}, {0, s, -s * d[1] / d[2]}};
+            double K[3][3] = {{0, -d[2], d[1]}, {d[2], 0, -d[0]}, {-d[1], d[0], 0}};  // [d0]x
+            double row[5];
+            for (int k = 0; k < 3; k++) {
+                double jx = 0, jy = 0;
+                for (int m = 0; m < 3; m++) {
+                    jx += Jd[0][m] * -K[m][k];
+                    jy += Jd[1][m] * -K[m][k];
+                }
+                row[k] = gbx * jx + gby * jy;
+            }
+            row[3] = -Ia;
+            row[4] = -1;
+            double w = std::fabs(e) <= 20 ? 1.0 : 20 / std::fabs(e);  // (Huber)
+            for (int r = 0; r < 5; r++) {
+                for (int c = 0; c < 5; c++) A.at<double>(r, c) += w * row[r] * row[c];
+                rhs.at<double>(r) += -w * row[r] * e;
+            }
+            sumAbs += std::fabs(e);
+            used++;
+        }
+        if (used < 150) return false;
+        if (it == 0) before = sumAbs / used;
+        after = sumAbs / used;
+        points = used;
+        for (int r = 0; r < 5; r++) A.at<double>(r, r) += 1e-6;
+        Mat x;
+        if (!cv::solve(A, rhs, x, cv::DECOMP_CHOLESKY)) return false;
+        Vec3d w(x.at<double>(0), x.at<double>(1), x.at<double>(2));
+        Rji = expSO3(w) * Rji;
+        alpha += x.at<double>(3);
+        beta += x.at<double>(4);
+        if (cv::norm(w) < 1e-5) break;
+    }
+    return after < 0.8 * before && angleOf(Rji * R0.t()) < rad(6);
+}
+
 struct View {
     int w = 0, h = 0;                // at match scale
     double scale = 1;                // match pixels per photo pixel
+    Small s8, s4;                    // for the direct alignment: 1/8 and 1/4 of match scale
     std::vector<cv::KeyPoint> kps;
     Mat desc;
     std::vector<Vec3d> rays;         // camera-frame unit rays of the keypoints
@@ -119,7 +219,7 @@ struct PairMatch {
     std::vector<Point2d> pi, pj;     // match-scale pixels
     std::vector<double> wk;          // per-match weights (the ground's: see groundWeight)
     double w = 1;
-    bool sensor = false;
+    bool sensor = false, direct = false;
     int inliers = 0, putative = 0;
 };
 
@@ -568,6 +668,8 @@ NSArray<NSNumber *> *arrayFrom(const Matx33d &R) {
         cxm = (v.w - 1) / 2.0;
         cym = (v.h - 1) / 2.0;
         orb->detectAndCompute(gray, cv::noArray(), v.kps, v.desc);
+        v.s8 = makeSmall(gray, fm, 0.125);
+        v.s4 = makeSmall(gray, fm, 0.25);
         v.rays.resize(v.kps.size());
         v.lat.resize(v.kps.size());
         for (size_t k = 0; k < v.kps.size(); k++) {
@@ -639,7 +741,7 @@ NSArray<NSNumber *> *arrayFrom(const Matx33d &R) {
             matched[j].push_back(i);
         }
     }
-    int imagePairs = (int)pairs.size();
+    int imagePairs = (int)pairs.size(), directPairs = 0;
     int keptPoints = 0;
     for (auto &p : pairs) keptPoints += (int)p.pi.size();
     // sensor pairs: a weak tie between each photo and the one before when no image match links them (GCam: SENSOR_PAIR,
@@ -692,6 +794,61 @@ NSArray<NSNumber *> *arrayFrom(const Matx33d &R) {
         }
         Matx33d G = rotY(yawOf(P.R0[0]) - yawOf(R[0]));
         for (auto &Ri : R) Ri = G * Ri;
+
+        // ---- plain walls: pairs the features left weak are aligned directly on the pixels from the adjusted rotations,
+        // and the result feeds a second adjustment as a grid of correspondences (GCam went to line features here)
+        report(0.56, @"aligning plain walls");
+        int refined = 0;
+        for (int i = 0; i < n; i++) {
+            for (int j = i + 1; j < n; j++) {
+                View &a = views[i], &b = views[j];
+                if (angleBetween(forwardOf(R[i]), forwardOf(R[j])) >= 0.8 * fovLong) continue;
+                int inl = 0;
+                for (auto &pm : pairs)
+                    if (!pm.sensor && pm.i == i && pm.j == j) inl = std::max(inl, pm.inliers);
+                if (inl >= 20) continue;
+                Matx33d Rji = R[j].t() * R[i];
+                double before = 0, after = 0;
+                int pts = 0;
+                if (!refineDirect(a.s8, b.s8, Rji, before, after, pts)) continue;
+                if (!refineDirect(a.s4, b.s4, Rji, before, after, pts)) continue;
+                PairMatch pm;
+                pm.i = i;
+                pm.j = j;
+                pm.direct = true;
+                pm.w = 0.6;
+                for (int gy = 0; gy < 5; gy++)
+                    for (int gx = 0; gx < 5; gx++) {
+                        Point2d p(a.w * (0.1 + 0.2 * gx), a.h * (0.1 + 0.2 * gy));
+                        Vec3d d = Rji * Vec3d((p.x - cxm) / fm, (p.y - cym) / fm, 1);
+                        if (d[2] <= 0.05) continue;
+                        Point2d q(fm * d[0] / d[2] + cxm, fm * d[1] / d[2] + cym);
+                        if (q.x < 0 || q.y < 0 || q.x > b.w - 1 || q.y > b.h - 1) continue;
+                        pm.pi.push_back(p);
+                        pm.pj.push_back(q);
+                    }
+                if (pm.pi.size() >= 6) {
+                    pairs.push_back(pm);
+                    refined++;
+                }
+            }
+        }
+        if (refined > 0) {
+            BAProblem P2 = P;
+            P2.R0 = R;
+            P2.f0 = fAdj;
+            std::vector<Matx33d> R2;
+            double f2 = fAdj;
+            bundleAdjust(P2, R2, f2);
+            double fov2 = deg(2 * std::atan(std::max(views[0].w, views[0].h) / 2.0 / f2));
+            if (fov2 > 10 && fov2 < 150 && std::isfinite(f2)) {
+                Matx33d G2 = rotY(yawOf(P.R0[0]) - yawOf(R2[0]));
+                for (auto &Ri : R2) Ri = G2 * Ri;
+                R = R2;
+                fAdj = f2;
+            }
+        }
+        directPairs = refined;
     } else {
         R = P.R0;
     }
@@ -823,7 +980,7 @@ NSArray<NSNumber *> *arrayFrom(const Matx33d &R) {
     res.cropTop = top;
     res.fullCircle = full;
     res.imagesUsed = n;
-    res.pairsMatched = imagePairs;
+    res.pairsMatched = imagePairs + directPairs;
     res.focalPx = fFull;
     res.seconds = ((double)cv::getTickCount() - t0) / cv::getTickFrequency();
     NSMutableArray *rots = [NSMutableArray array];
@@ -847,18 +1004,58 @@ NSArray<NSNumber *> *arrayFrom(const Matx33d &R) {
                                                  width:(int)width
                                                 height:(int)height
                                              panoWidth:(int)panoWidth {
+    return [self selfTestGenerateInDirectory:dir yaws:yaws pitches:pitches fovDeg:fovDeg width:width height:height panoWidth:panoWidth world:@"textured"];
+}
+
++ (nullable NSDictionary *)selfTestGenerateInDirectory:(NSString *)dir
+                                                  yaws:(NSArray<NSNumber *> *)yaws
+                                               pitches:(NSArray<NSNumber *> *)pitches
+                                                fovDeg:(double)fovDeg
+                                                 width:(int)width
+                                                height:(int)height
+                                             panoWidth:(int)panoWidth
+                                                 world:(NSString *)world {
     [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
     std::mt19937 rng(11);
     Equirect eq(panoWidth);
-    // a textured world: sky and ground, a horizon, thousands of shapes and lines, labels at the headings and poles
+    bool room = [world isEqualToString:@"room"];
     Mat pano(eq.H, eq.W, CV_8UC3);
-    for (int y = 0; y < eq.H; y++) {
-        double t = (double)y / eq.H;
-        cv::Vec3b c = t < 0.5 ? cv::Vec3b(230 - 120 * t, 170 + 60 * t, 120 + 40 * t) : cv::Vec3b(60 + 40 * t, 110 + 50 * t, 90 + 30 * t);
-        pano.row(y).setTo(c);
-    }
     std::uniform_real_distribution<double> U(0, 1);
-    for (int k = 0; k < 4000; k++) {
+    if (room) {  // a plain room: pale walls with soft shading, a ceiling, a wooden floor, a few things on the walls
+        for (int y = 0; y < eq.H; y++) {
+            double t = (double)y / eq.H;
+            for (int x = 0; x < eq.W; x++) {
+                double wall = 0.5 + 0.5 * std::cos(x * 8 * kPi / eq.W);  // (four walls, lit a little differently)
+                cv::Vec3b c;
+                if (t < 0.22) c = cv::Vec3b(236 - 12 * t / 0.22, 238 - 10 * t / 0.22, 240);
+                else if (t > 0.72) c = cv::Vec3b(80 + 20 * (t - 0.72), 120 + 20 * (t - 0.72), 160 + 10 * (t - 0.72));
+                else c = cv::Vec3b(205 + 18 * wall - 25 * (t - 0.22), 208 + 16 * wall - 25 * (t - 0.22), 210 + 12 * wall - 25 * (t - 0.22));
+                pano.at<cv::Vec3b>(y, x) = c;
+            }
+        }
+        for (int x = 0; x < eq.W; x += eq.W / 64) cv::line(pano, cv::Point(x, (int)(eq.H * 0.72)), cv::Point(x + eq.W / 32, eq.H - 1), cv::Scalar(70, 105, 140), 1);  // (floorboards)
+        cv::line(pano, cv::Point(0, (int)(eq.H * 0.22)), cv::Point(eq.W - 1, (int)(eq.H * 0.22)), cv::Scalar(150, 150, 150), 2);
+        cv::line(pano, cv::Point(0, (int)(eq.H * 0.72)), cv::Point(eq.W - 1, (int)(eq.H * 0.72)), cv::Scalar(90, 90, 90), 3);
+        for (int k = 0; k < 28; k++) {  // (pictures, a door, a window, switches: the few things to match)
+            cv::Point c((int)(U(rng) * eq.W), (int)(eq.H * (0.3 + 0.35 * U(rng))));
+            int w = (int)(eq.W * (0.01 + 0.04 * U(rng))), h = (int)(eq.H * (0.02 + 0.08 * U(rng)));
+            cv::Scalar col(90 + 120 * U(rng), 90 + 120 * U(rng), 90 + 120 * U(rng));
+            cv::rectangle(pano, c - cv::Point(w, h), c + cv::Point(w, h), col, -1);
+            cv::rectangle(pano, c - cv::Point(w, h), c + cv::Point(w, h), cv::Scalar(60, 60, 60), 2);
+        }
+        for (int k = 0; k < 10; k++) {
+            cv::Point c((int)(U(rng) * eq.W), (int)(eq.H * (0.74 + 0.15 * U(rng))));
+            cv::ellipse(pano, c, cv::Size((int)(eq.W * 0.01 + U(rng) * eq.W * 0.02), (int)(eq.H * 0.01 + U(rng) * eq.H * 0.02)), 0, 0, 360, cv::Scalar(40 + 60 * U(rng), 40 + 60 * U(rng), 40 + 60 * U(rng)), -1);
+        }
+    } else {
+        // a textured world: sky and ground, a horizon, thousands of shapes and lines, labels at the headings and poles
+        for (int y = 0; y < eq.H; y++) {
+            double t = (double)y / eq.H;
+            cv::Vec3b c = t < 0.5 ? cv::Vec3b(230 - 120 * t, 170 + 60 * t, 120 + 40 * t) : cv::Vec3b(60 + 40 * t, 110 + 50 * t, 90 + 30 * t);
+            pano.row(y).setTo(c);
+        }
+    }
+    for (int k = 0; k < (room ? 0 : 4000); k++) {
         cv::Point c((int)(U(rng) * eq.W), (int)(U(rng) * eq.H));
         cv::Scalar col(U(rng) * 255, U(rng) * 255, U(rng) * 255);
         int r = 4 + (int)(U(rng) * eq.W / 60);
@@ -867,12 +1064,12 @@ NSArray<NSNumber *> *arrayFrom(const Matx33d &R) {
         else
             cv::rectangle(pano, c - cv::Point(r, r / 2), c + cv::Point(r, r / 2), col, -1);
     }
-    for (int k = 0; k < 600; k++) {
+    for (int k = 0; k < (room ? 0 : 600); k++) {
         cv::Point a((int)(U(rng) * eq.W), (int)(U(rng) * eq.H));
         cv::Point b = a + cv::Point((int)((U(rng) - 0.5) * eq.W / 8), (int)((U(rng) - 0.5) * eq.H / 8));
         cv::line(pano, a, b, cv::Scalar(U(rng) * 255, U(rng) * 255, U(rng) * 255), 1 + (int)(U(rng) * 3), cv::LINE_AA);
     }
-    cv::line(pano, cv::Point(0, eq.H / 2), cv::Point(eq.W - 1, eq.H / 2), cv::Scalar(20, 20, 20), 2);
+    if (!room) cv::line(pano, cv::Point(0, eq.H / 2), cv::Point(eq.W - 1, eq.H / 2), cv::Scalar(20, 20, 20), 2);
     const char *labels[] = {"FRONT", "RIGHT", "BACK", "LEFT"};
     for (int k = 0; k < 4; k++) {
         int x = (int)(eq.W * (0.5 + 0.25 * k)) % eq.W;
