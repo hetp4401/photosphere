@@ -79,7 +79,7 @@ constexpr double kLatGateDeg = 9.0;
 constexpr double kCycleDeg = 4.0;        // without a gyro, a pair is believed when a third photo closes the triangle within this
 constexpr int kStrongEdge = 40;          // ...or when it has this many inliers on its own
 constexpr double kSupportPx = 25.0;
-constexpr double kFocalPriorPx = 3000.0; // the focal stays near the lens's (exact on an iPhone): this many match pixels per unit of ln(f / f0)
+constexpr double kFocalPriorPx = 300.0;  // a weak pull of the focal toward the lens's: a phone turned at arm's length fits a longer one
 constexpr double kPriorAgreeDeg = 10.0;  // without a gyro, a pair must agree with the verified placement within this      // ...and a photo stays when one of its matches holds within this after the adjustment
 constexpr double kGammaMax = 2.5;        // a photo's gamma at most (GCam: 1.75; an iPhone's auto exposure spans more)      // and a match's two rays must lie within this latitude band (GCam: 6 deg bins +-1)
 
@@ -165,6 +165,7 @@ Matx33d kabsch(const std::vector<Vec3d> &a, const std::vector<Vec3d> &b, const s
 /// 128 + 128 (I - mean) / (2 sd), so exposure doesn't matter).
 struct Small {
     Mat g, gx, gy;
+    Mat hp;                          // g without its smooth shading (edges and marks only)
     double f = 1, cx = 0, cy = 0;
 };
 
@@ -178,10 +179,41 @@ Small makeSmall(const Mat &gray, double f, double scale) {
     cv::GaussianBlur(s.g, s.g, cv::Size(3, 3), 0);
     cv::Sobel(s.g, s.gx, CV_32F, 1, 0, 3, 1 / 8.0);
     cv::Sobel(s.g, s.gy, CV_32F, 0, 1, 3, 1 / 8.0);
+    Mat low;
+    cv::GaussianBlur(s.g, low, cv::Size(0, 0), std::max(2.0, s.g.cols / 10.0));
+    s.hp = s.g - low;
     s.f = f * scale;
     s.cx = (s.g.cols - 1) / 2.0;
     s.cy = (s.g.rows - 1) / 2.0;
     return s;
+}
+
+/// The correlation of two photos' edges and marks (shading removed) where k, taken into a's camera by Rak, overlaps a;
+/// -1 when the overlap is too small or plain. A ceiling's smooth falloff correlates with anything; its edges do not.
+inline double correlation(const Small &k, const Small &a, const Matx33d &Rak, int &inside) {
+    double sk = 0, sa = 0, skk = 0, saa = 0, ska = 0;
+    int total = 0;
+    inside = 0;
+    for (int y = 2; y < k.hp.rows - 2; y += 2)
+        for (int x = 2; x < k.hp.cols - 2; x += 2) {
+            total++;
+            Vec3d d = Rak * Vec3d((x - k.cx) / k.f, (y - k.cy) / k.f, 1);
+            if (d[2] <= 0.1) continue;
+            double qx = a.f * d[0] / d[2] + a.cx, qy = a.f * d[1] / d[2] + a.cy;
+            if (qx < 1 || qy < 1 || qx >= a.hp.cols - 2 || qy >= a.hp.rows - 2) continue;
+            double vk = k.hp.at<float>(y, x), va = bilinear(a.hp, qx, qy);
+            sk += vk;
+            sa += va;
+            skk += vk * vk;
+            saa += va * va;
+            ska += vk * va;
+            inside++;
+        }
+    if (inside < 0.15 * total || inside < 60) return -1.0;
+    double mk = sk / inside, ma = sa / inside;
+    double vk = skk / inside - mk * mk, va = saa / inside - ma * ma;
+    if (vk < 36 || va < 36) return -1.0;  // (plain: nothing to correlate)
+    return (ska / inside - mk * ma) / std::sqrt(vk * va);
 }
 
 float bilinear(const Mat &g, double x, double y) {
@@ -1137,6 +1169,21 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
             if (pass == 0) lineMatches = matchAllLines(R);  // (matched again from the better rotations, then adjusted once more)
         }
         directPairs = refined;
+        if (!sensors) {  // a photo with no match of its own (placed by the pixels) must agree with a neighbour's edges where it ended up
+            std::vector<bool> hasF(n, false);
+            for (auto &pm : pairs)
+                if (!pm.sensor && !pm.direct) hasF[pm.i] = hasF[pm.j] = true;
+            for (int i = 0; i < n; i++) {
+                if (dead[i] || hasF[i]) continue;
+                double bestC = -1;
+                for (int j = 0; j < n; j++) {
+                    if (j == i || dead[j] || angleBetween(forwardOf(R[i]), forwardOf(R[j])) >= 0.8 * fovLong) continue;
+                    int inside;
+                    bestC = std::max(bestC, correlation(views[i].s4, views[j].s4, R[j].t() * R[i], inside));
+                }
+                if (bestC < 0.5) dead[i] = true;
+            }
+        }
     } else {
         R = P.R0;
     }
@@ -1419,31 +1466,6 @@ inline Bootstrap bootstrap(const std::vector<std::string> &paths, double focalPx
     // nearest placed photos before and after it: a search over yaw and pitch of the whole overlap at 1/16 scale by
     // correlation (a plain overlap scores nothing), then the tracker's refinement up to 1/4 scale. It is placed when
     // both neighbours agree within 3 deg, or one correlates strongly. (GCam had the gyro for this.)
-    auto correlation = [&](const Small &k, const Small &a, const Matx33d &Rak, int &inside) {
-        double sk = 0, sa = 0, skk = 0, saa = 0, ska = 0;
-        int total = 0;
-        inside = 0;
-        for (int y = 2; y < k.g.rows - 2; y += 2)
-            for (int x = 2; x < k.g.cols - 2; x += 2) {
-                total++;
-                Vec3d d = Rak * Vec3d((x - k.cx) / k.f, (y - k.cy) / k.f, 1);
-                if (d[2] <= 0.1) continue;
-                double qx = a.f * d[0] / d[2] + a.cx, qy = a.f * d[1] / d[2] + a.cy;
-                if (qx < 1 || qy < 1 || qx >= a.g.cols - 2 || qy >= a.g.rows - 2) continue;
-                double vk = k.g.at<float>(y, x), va = bilinear(a.g, qx, qy);
-                sk += vk;
-                sa += va;
-                skk += vk * vk;
-                saa += va * va;
-                ska += vk * va;
-                inside++;
-            }
-        if (inside < 0.15 * total || inside < 60) return -1.0;
-        double mk = sk / inside, ma = sa / inside;
-        double vk = skk / inside - mk * mk, va = saa / inside - ma * ma;
-        if (vk < 64 || va < 64) return -1.0;  // (plain: nothing to correlate)
-        return (ska / inside - mk * ma) / std::sqrt(vk * va);
-    };
     int secondChance = 0;
     for (int k = 0; k < n; k++) {
         if (placed[k]) continue;
@@ -1506,7 +1528,7 @@ inline Bootstrap bootstrap(const std::vector<std::string> &paths, double focalPx
             double c = correlation(s4[k], s4[a], Rak, inside);
             snprintf(buf, sizeof buf, ", fine %.2f, refined %d/2 (%.0f->%.0f, %d pts), corr %.2f at 1/4; ", bestC, level, before, after, pts, c);
             out.log += buf;
-            if (c >= 0.6) found.push_back({R[a] * Rak, c});
+            if (c >= 0.5) found.push_back({R[a] * Rak, c});
         }
         bool ok = false;
         Matx33d Rk;
@@ -1514,7 +1536,7 @@ inline Bootstrap bootstrap(const std::vector<std::string> &paths, double focalPx
             ok = true;
             Rk = found[0].second >= found[1].second ? found[0].first : found[1].first;
         } else {
-            double bestC = 0.8;  // (one neighbour alone must correlate strongly)
+            double bestC = 0.7;  // (one neighbour alone must correlate strongly)
             for (auto &f : found)
                 if (f.second >= bestC) {
                     ok = true;
