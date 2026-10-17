@@ -23,6 +23,7 @@ struct RootView: View {
     @State private var panoramas: [URL] = []
     @AppStorage("outputWidth") private var outputWidth = 6144
     @AppStorage("saveToPhotos") private var saveToPhotos = true
+    @AppStorage("nadirPatchDeg") private var nadirPatchDeg = 25.0
 
     var body: some View {
         NavigationStack {
@@ -58,6 +59,12 @@ struct RootView: View {
                         Text("8192 x 4096 (slow)").tag(8192)
                     }
                     Toggle("Save to Photos", isOn: $saveToPhotos)
+                    Picker("Hide the ground under me", selection: $nadirPatchDeg) {
+                        Text("Off").tag(0.0)
+                        Text("Small (15°)").tag(15.0)
+                        Text("Medium (25°)").tag(25.0)
+                        Text("Large (35°)").tag(35.0)
+                    }
                 }
             }
             .navigationTitle("PhotoSphere")

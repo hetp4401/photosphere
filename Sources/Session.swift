@@ -1,8 +1,8 @@
 import Foundation
 import UIKit
 
-/// A capture in progress: its photos on disk (upright, at most 2016 px on the long side, as Google Camera's ~1800), each
-/// with the rotation the sensors gave at the moment the dot was hit.
+/// A capture in progress: its photos on disk (upright, at most 3024 px on the long side; Google Camera used ~1800), each
+/// with the rotation the sensors gave at the moment the dot was hit. The last capture's folder is kept for sharing.
 struct Shot: Codable {
     let file: String
     let rotation: [Double]  // world-from-camera, row-major
@@ -22,14 +22,27 @@ struct SessionInfo: Codable {
 }
 
 final class CaptureSession {
-    static let maxSide = 2016
+    static let maxSide = 3024
     let dir: URL
     private(set) var info = SessionInfo()
 
     init() {
         let name = Self.stamp(Date())
+        try? FileManager.default.removeItem(at: Self.sessionsDir)  // (older captures go)
         dir = Self.sessionsDir.appendingPathComponent(name)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    }
+
+    /// The folder zipped (photos and session.json), for sending away.
+    static func zip(_ dir: URL) -> URL? {
+        var err: NSError?
+        var out: URL?
+        NSFileCoordinator().coordinate(readingItemAt: dir, options: .forUploading, error: &err) { zipURL in
+            let dst = FileManager.default.temporaryDirectory.appendingPathComponent(dir.lastPathComponent + ".zip")
+            try? FileManager.default.removeItem(at: dst)
+            if (try? FileManager.default.copyItem(at: zipURL, to: dst)) != nil { out = dst }
+        }
+        return out
     }
 
     static var documents: URL { FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0] }

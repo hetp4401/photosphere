@@ -13,7 +13,7 @@ final class StitchJob: ObservableObject {
     @Published var summary = ""
     @Published var failure: String?
 
-    func run(session: CaptureSession, outputWidth: Int, saveToPhotos: Bool) {
+    func run(session: CaptureSession, outputWidth: Int, saveToPhotos: Bool, nadirPatchDeg: Double) {
         let info = session.info
         let dir = session.dir
         Task.detached(priority: .userInitiated) {
@@ -24,7 +24,7 @@ final class StitchJob: ObservableObject {
                 let longFov = max(info.hfovDeg, info.vfovDeg) * .pi / 180
                 let focalPx = info.focalPx > 0 ? info.focalPx : (longSide / 2) / tan(longFov / 2)
                 let raw = FileManager.default.temporaryDirectory.appendingPathComponent("pano_raw.jpg")
-                let res = try PanoStitcher.stitchImages(paths, rotations: rotations, focalPx: focalPx, outputWidth: Int32(outputWidth), outputPath: raw.path, priorsFromSensors: true) { f, s in
+                let res = try PanoStitcher.stitchImages(paths, rotations: rotations, focalPx: focalPx, outputWidth: Int32(outputWidth), outputPath: raw.path, priorsFromSensors: true, nadirPatchDeg: nadirPatchDeg) { f, s in
                     Task { @MainActor in
                         self.fraction = f
                         self.stage = s
@@ -41,7 +41,6 @@ final class StitchJob: ObservableObject {
                 let out = CaptureSession.panoramasDir.appendingPathComponent("\(CaptureSession.stamp(first)).jpg")
                 try data.write(to: out, options: .atomic)
                 try? FileManager.default.removeItem(at: raw)
-                try? FileManager.default.removeItem(at: dir)
                 if saveToPhotos {
                     let status = await PHPhotoLibrary.requestAuthorization(for: .addOnly)
                     if status == .authorized || status == .limited {
@@ -67,13 +66,21 @@ struct StitchView: View {
     @StateObject private var job = StitchJob()
     @AppStorage("outputWidth") private var outputWidth = 6144
     @AppStorage("saveToPhotos") private var saveToPhotos = true
+    @AppStorage("nadirPatchDeg") private var nadirPatchDeg = 25.0
+    @State private var share: ShareItem?
 
     var body: some View {
         VStack(spacing: 24) {
             if let url = job.result {
                 PanoViewer(url: url).ignoresSafeArea()
                 Text(job.summary).font(.footnote).foregroundStyle(.secondary).padding(.horizontal)
-                Button("Done") { onDone(url) }.buttonStyle(.borderedProminent)
+                HStack(spacing: 16) {
+                    Button("Share the photos") {  // (the capture itself, zipped: photos and sensor data)
+                        if let z = CaptureSession.zip(session.dir) { share = ShareItem(url: z) }
+                    }.buttonStyle(.bordered)
+                    Button("Done") { onDone(url) }.buttonStyle(.borderedProminent)
+                }
+                .sheet(item: $share) { ShareSheet(items: [$0.url]) }
             } else if let f = job.failure {
                 Text("Stitching failed").font(.title3.bold())
                 Text(f).foregroundStyle(.secondary).multilineTextAlignment(.center).padding(.horizontal)
@@ -87,6 +94,17 @@ struct StitchView: View {
             }
         }
         .padding(.vertical)
-        .onAppear { job.run(session: session, outputWidth: outputWidth, saveToPhotos: saveToPhotos) }
+        .onAppear { job.run(session: session, outputWidth: outputWidth, saveToPhotos: saveToPhotos, nadirPatchDeg: nadirPatchDeg) }
     }
+}
+
+struct ShareItem: Identifiable {
+    let id = UUID()
+    let url: URL
+}
+
+struct ShareSheet: UIViewControllerRepresentable {
+    let items: [Any]
+    func makeUIViewController(context: Context) -> UIActivityViewController { UIActivityViewController(activityItems: items, applicationActivities: nil) }
+    func updateUIViewController(_ vc: UIActivityViewController, context: Context) {}
 }
