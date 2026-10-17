@@ -19,6 +19,7 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic) double focalPx;
 @property (nonatomic) double seconds;
 @property (nonatomic, copy) NSArray<NSArray<NSNumber *> *> *rotations;
+@property (nonatomic, copy) NSString *notes;
 @end
 
 typedef void (^PanoProgress)(double fraction, NSString *stage);

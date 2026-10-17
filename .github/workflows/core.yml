@@ -1,0 +1,55 @@
+# The stitcher's core on a Linux runner, in minutes: the two synthetic worlds, then the owner's room photos (from a
+# private link in a secret; the result stays in an artifact).
+name: core
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+concurrency:
+  group: core
+  cancel-in-progress: true
+jobs:
+  core:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: opencv
+        run: |
+          sudo apt-get update -qq > /dev/null
+          sudo apt-get install -y -qq libopencv-dev > /dev/null
+          pkg-config --modversion opencv4
+      - name: build
+        run: |
+          g++ -O2 -std=c++17 -o harness tools/harness.cpp $(pkg-config --cflags --libs opencv4) -lpthread 2> build.log || { grep -E "error" build.log | head -30; exit 1; }
+          grep -c warning build.log || true
+      - name: synthetic worlds
+        run: |
+          mkdir -p out
+          ./harness synth textured out/textured | tee out/textured.txt || true
+          ./harness synth room out/room | tee out/room.txt || true
+          cp out/textured/result.jpg out/textured-pano.jpg; cp out/room/result.jpg out/room-pano.jpg; cp out/room/truth.jpg out/room-truth.jpg
+          grep -q PASS out/textured.txt
+      - name: the owner's room
+        if: always()
+        env:
+          ROOM_URLS: ${{ secrets.ROOM_URLS }}
+        run: |
+          [ -z "$ROOM_URLS" ] && { echo "no photos"; exit 0; }
+          mkdir -p photos private
+          i=0
+          while read -r u; do [ -z "$u" ] && continue; i=$((i + 1)); curl -sL -A "Mozilla/5.0" -o "photos/$(printf %02d "$i").jpg" "$u"; done <<< "$ROOM_URLS"
+          echo "$(ls photos | wc -l) photos"
+          time ./harness stitch photos 1344 private/room.jpg 4096 | tee private/room.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: core-synthetic
+          path: out/*.jpg
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: core-room
+          path: private
+          if-no-files-found: ignore

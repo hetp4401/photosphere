@@ -59,7 +59,7 @@ final class StitchDirModel: ObservableObject {
                 let out = CaptureSession.panoramasDir.appendingPathComponent("\(name).jpg")
                 try data.write(to: out, options: .atomic)
                 lines.append(String(format: "stitch: %d photos, %d feature pairs, %d direct pairs, focal %.0f px, crop %dx%d of %dx%d, full circle %d, %.1f s",
-                                    res.imagesUsed, res.pairsMatched, res.pairsDirect, res.focalPx, res.cropWidth, res.cropHeight, res.fullWidth, res.fullHeight, res.fullCircle ? 1 : 0, res.seconds))
+                                    res.imagesUsed, res.pairsMatched, res.pairsDirect, res.focalPx, res.cropWidth, res.cropHeight, res.fullWidth, res.fullHeight, res.fullCircle ? 1 : 0, res.seconds + " " + res.notes)
                 lines.append("DONE")
                 await MainActor.run { self.panoURL = out }
             } catch {
