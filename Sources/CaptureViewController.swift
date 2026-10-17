@@ -143,7 +143,7 @@ final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelega
             }
             self.captureSession.addInput(input)
             if self.captureSession.canAddOutput(self.photoOutput) { self.captureSession.addOutput(self.photoOutput) }
-            self.photoOutput.maxPhotoQualityPrioritization = .balanced
+            self.photoOutput.maxPhotoQualityPrioritization = .speed  // (no Deep Fusion: each photo processed alike)
             self.captureSession.commitConfiguration()
             self.device = dev
             // the lens's field of view: AVFoundation gives the sensor's horizontal one (its long side); as held in
@@ -239,6 +239,7 @@ final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelega
     }
 
     private func firstPhoto(refFromDevice: Mat3) {
+        lockLens()
         world.fix(refFromDevice: refFromDevice)
         let R = world.worldFromCam(refFromDevice: refFromDevice)
         let roll = Orient.roll(R)
@@ -248,6 +249,22 @@ final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelega
         overlay.clearDots()
         if let h = heading { session.setHeading(h) }
         takePhoto(rotation: R)
+    }
+
+    /// From the first photo on, the lens stays focused at infinity (GCam: FOCUS_MODE_INFINITY), so every photo has the same
+    /// field of view (autofocus changes it a little), and the white balance stays as it was.
+    private func lockLens() {
+        guard let dev = device, (try? dev.lockForConfiguration()) != nil else { return }
+        if dev.isFocusModeSupported(.locked) { dev.setFocusModeLocked(lensPosition: 1.0, completionHandler: nil) }
+        if dev.isWhiteBalanceModeSupported(.locked) { dev.whiteBalanceMode = .locked }
+        dev.unlockForConfiguration()
+    }
+
+    private func unlockLens() {
+        guard let dev = device, (try? dev.lockForConfiguration()) != nil else { return }
+        if dev.isFocusModeSupported(.continuousAutoFocus) { dev.focusMode = .continuousAutoFocus }
+        if dev.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) { dev.whiteBalanceMode = .continuousAutoWhiteBalance }
+        dev.unlockForConfiguration()
     }
 
     // MARK: photos
@@ -260,7 +277,7 @@ final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelega
         if let t = targets { counterLabel.text = "\(t.capturedCount) of \(t.total)" }
         hintLabel.text = "Hold still…"
         let settings = AVCapturePhotoSettings(format: [AVVideoCodecKey: AVVideoCodecType.jpeg])
-        settings.photoQualityPrioritization = .balanced
+        settings.photoQualityPrioritization = .speed
         if let c = photoOutput.connection(with: .video) { Self.portrait(c) }
         photoOutput.capturePhoto(with: settings, delegate: self)
         AudioServicesPlaySystemSound(1108)
@@ -293,6 +310,7 @@ final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelega
     }
 
     private func resetToStart() {
+        unlockLens()
         targets = nil
         world.release()
         lockedRoll = nil

@@ -117,6 +117,7 @@ struct View {
 struct PairMatch {
     int i = 0, j = 0;
     std::vector<Point2d> pi, pj;     // match-scale pixels
+    std::vector<double> wk;          // per-match weights (the ground's: see groundWeight)
     double w = 1;
     bool sensor = false;
     int inliers = 0, putative = 0;
@@ -199,8 +200,9 @@ void baResiduals(const BAProblem &P, const std::vector<double> &x, std::vector<d
         for (size_t k = 0; k < pm.pi.size(); k++) {
             Vec3d d = Rji * Vec3d((pm.pi[k].x - P.cx) / f, (pm.pi[k].y - P.cy) / f, 1);
             double z = std::max(d[2], 0.05);  // (a point behind the camera: a large residual, bounded by Huber)
-            r.push_back(pm.w * (f * d[0] / z + P.cx - pm.pj[k].x));
-            r.push_back(pm.w * (f * d[1] / z + P.cy - pm.pj[k].y));
+            double w = pm.w * (k < pm.wk.size() ? pm.wk[k] : 1.0);
+            r.push_back(w * (f * d[0] / z + P.cx - pm.pj[k].x));
+            r.push_back(w * (f * d[1] / z + P.cy - pm.pj[k].y));
         }
     }
     for (int i = 0; i < P.n; i++) {  // the gravity priors: tilt, and roll with half the weight (GCam: SensorResidual, RollPitchSensorResidual)
@@ -517,6 +519,10 @@ NSArray<NSNumber *> *arrayFrom(const Matx33d &R) {
             for (int k : keep) {
                 pm.pi.push_back(Point2d(a.kps[ka[inl[k]]].pt.x, a.kps[ka[inl[k]]].pt.y));
                 pm.pj.push_back(Point2d(b.kps[kb[inl[k]]].pt.x, b.kps[kb[inl[k]]].pt.y));
+                // the ground (GCam: DownWeightGroundPoints(-45 deg, 0.1)): a match below -45 deg of latitude under the sensors
+                // weighs from 1 there down to 0.1 at the nadir (the phone orbits the hand, not the lens: parallax is worst there)
+                double lat = a.lat[ka[inl[k]]], lim = rad(-45);
+                pm.wk.push_back(lat >= lim ? 1.0 : 1.0 - 0.9 * std::min(1.0, (lim - lat) / (kPi / 2 + lim)));
             }
             pairs.push_back(pm);
             matched[i].push_back(j);
