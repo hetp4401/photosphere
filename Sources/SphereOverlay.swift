@@ -200,6 +200,9 @@ final class SphereOverlay {
         m.diffuse.contents = image
         m.lightingModel = .constant
         m.isDoubleSided = true
+        m.diffuse.minificationFilter = .linear  // (smooth at any size: mipmapped, no shimmer or blocks)
+        m.diffuse.magnificationFilter = .linear
+        m.diffuse.mipFilter = .linear
         m.readsFromDepthBuffer = false  // (GCam: no depth test, drawn in capture order: the latest photo on top)
         m.writesToDepthBuffer = false
         plane.firstMaterial = m

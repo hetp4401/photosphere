@@ -79,7 +79,7 @@ final class CaptureSession {
         }
         info.shots.append(Shot(file: name, rotation: Orient.flat(rotation), time: Date().timeIntervalSince1970, exposure: exposure))
         save()
-        return Self.upright(photo, maxSide: 512)
+        return Self.upright(photo, maxSide: 1024)  // (the live mosaic's tile: sharp at the size the capture view draws it)
     }
 
     func setHeading(_ deg: Double) { info.headingDeg = deg }

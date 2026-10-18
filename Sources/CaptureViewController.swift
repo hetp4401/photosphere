@@ -10,7 +10,9 @@ import simd
 /// The capture screen, as Google Camera's Photo Sphere worked: the phone's motion sensors alone say where the camera
 /// points, dots on a sphere say where to point it next, and a photo is taken by itself when the camera settles on a dot.
 /// The view is GCam's: the scene seen 1.7x wider than the lens on a dark ground, the camera's frame a fixed outline in the
-/// middle with the live picture inside it until the first photo, then only the photos taken, pasted where they belong.
+/// middle with the live picture inside it, and the photos taken pasted where they belong. (GCam hid the live picture after
+/// the first photo, leaving only its low-resolution preview tiles; at each dot that looked pixelated, so the live picture
+/// stays.)
 final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelegate, CLLocationManagerDelegate {
     var onFinished: ((CaptureSession) -> Void)?
     var onCancel: (() -> Void)?
@@ -77,7 +79,7 @@ final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelega
     }
 
     /// GCam's view (LightCycleRenderer): the screen's width spans 1.7x the tangent of the lens's long side, so the camera's
-    /// frame is a fixed rectangle about 44% of the width in the middle; the live picture fills it until the first photo.
+    /// frame is a fixed rectangle about 44% of the width in the middle; the live picture fills it.
     private func layoutPreview() {
         scnView.frame = view.bounds
         let tanV = tan(vfov / 2), tanH = tan(hfov / 2)
@@ -347,7 +349,6 @@ final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelega
         overlay.clearDots()
         if let h = heading { session.setHeading(h) }
         takePhoto(rotation: R)
-        previewLayer?.isHidden = true  // (GCam: from the first photo on, the mosaic and the frame's outline only)
         overlay.revealDots()
     }
 

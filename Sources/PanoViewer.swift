@@ -64,6 +64,10 @@ struct PanoViewer: UIViewRepresentable {
             let (fw, fh, cw, ch, left, top) = crop ?? (Double(size.0), Double(size.0) / 2, Double(size.0), Double(size.1), 0, (Double(size.0) / 2 - Double(size.1)) / 2)
             let m = SCNMaterial()
             m.diffuse.contents = image
+            m.diffuse.minificationFilter = .linear  // (mipmapped and anisotropic: smooth when small or at a slant)
+            m.diffuse.magnificationFilter = .linear
+            m.diffuse.mipFilter = .linear
+            m.diffuse.maxAnisotropy = 8
             m.isDoubleSided = true
             m.lightingModel = .constant
             let geometry = Self.patch(fullW: fw, fullH: fh, cropW: cw, cropH: ch, left: left, top: top, radius: 10)
