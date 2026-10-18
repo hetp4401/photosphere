@@ -43,6 +43,8 @@ jobs:
           i=0
           while read -r u; do [ -z "$u" ] && continue; i=$((i + 1)); curl -sL -A "Mozilla/5.0" -o "photos/$(printf %02d "$i").jpg" "$u"; done <<< "$ROOM_URLS"
           echo "$(ls photos | wc -l) photos"
+          ok=0; for f in photos/*.jpg; do [ "$(head -c 2 "$f" | od -An -tx1 | tr -d ' ')" = "ffd8" ] && ok=$((ok + 1)); done
+          if [ "$ok" -lt 10 ]; then echo "only $ok are photos: the link no longer serves them (album unshared or expired), skipped"; exit 0; fi
           time ./harness stitch photos 1470 private/room.jpg 26 | tee private/room.txt
       - uses: actions/upload-artifact@v4
         if: always()

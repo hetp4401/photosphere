@@ -83,6 +83,8 @@ jobs:
             curl -sL -A "Mozilla/5.0" -o "room/$(printf %02d "$i").jpg" "$u"
           done <<< "$ROOM_URLS"
           echo "$(ls room | wc -l) photos"
+          ok=0; for f in room/*.jpg; do [ "$(head -c 2 "$f" | od -An -tx1 | tr -d ' ')" = "ffd8" ] && ok=$((ok + 1)); done
+          if [ "$ok" -lt 10 ]; then echo "only $ok are photos: the link no longer serves them (album unshared or expired), skipped"; exit 0; fi
           CONT=$(xcrun simctl get_app_container "$DEV" "$BUNDLE" data)
           mkdir -p "$CONT/tmp/room"
           cp room/*.jpg "$CONT/tmp/room/"
