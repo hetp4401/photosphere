@@ -1431,9 +1431,11 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
         };
         int refined = 0;
         if (sensors) {
-            // GCam's line pass (LineAligner, after the main adjustment): lines for the photos that matched nothing, the sensor
-            // ties between photos the lines now hold cut to an eighth, and one more adjustment with the focal held
-            lineMatches = matchAllLines(R, true);
+            // GCam's line pass (LineAligner, after the main adjustment): straight edges matched between overlapping photos,
+            // the sensor ties between photos the lines now hold cut to an eighth, and one more adjustment with the focal
+            // held. (GCam probably ran it only for photos that matched nothing; here every overlapping pair, so door
+            // frames, sills and baseboards line up across the seams where a hand-held phone's parallax breaks them.)
+            lineMatches = matchAllLines(R, false);
             if (lineMatches > 0) {
                 std::set<std::pair<int, int>> held;
                 for (auto &lm : lines) held.insert({std::min(lm.i, lm.j), std::max(lm.i, lm.j)});

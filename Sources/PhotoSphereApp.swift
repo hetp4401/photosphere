@@ -22,6 +22,7 @@ struct RootView: View {
     @State private var stitching: CaptureSession?
     @State private var panoramas: [URL] = []
     @AppStorage("outputMegapixels") private var outputMegapixels = 26.0
+    @AppStorage("closerDots") private var closerDots = false
     @AppStorage("saveToPhotos") private var saveToPhotos = true
     @AppStorage("nadirPatchDeg") private var nadirPatchDeg = 0.0
 
@@ -51,6 +52,16 @@ struct RootView: View {
                         idx.map { panoramas[$0] }.forEach { try? FileManager.default.removeItem(at: $0) }
                         reload()
                     }
+                }
+                Section {
+                    Picker("Dots", selection: $closerDots) {
+                        Text("Google Camera's (about 32 photos)").tag(false)
+                        Text("Closer (about 46 photos)").tag(true)
+                    }
+                } header: {
+                    Text("Capture")
+                } footer: {
+                    Text("Closer dots mean smaller turns between photos: less doubling of things near you when the phone moves a little.")
                 }
                 Section("Output") {
                     Picker("Quality", selection: $outputMegapixels) {  // (Google Camera's three: low, high, max)

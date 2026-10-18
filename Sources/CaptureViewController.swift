@@ -44,6 +44,7 @@ final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelega
 
     private let hintLabel = UILabel()
     private let counterLabel = UILabel()
+    private let tipLabel = UILabel()  // GCam's tutorial ("keep the camera centered"), until the first photo
     private let reticle = UIView()
     private let undoButton = UIButton(type: .system)
     private let doneButton = UIButton(type: .system)
@@ -132,7 +133,13 @@ final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelega
             view.addSubview(b)
         }
         doneButton.backgroundColor = UIColor(red: 0.2, green: 0.6, blue: 1, alpha: 0.9)
-        [reticle, hintLabel, counterLabel, cancelButton, undoButton, doneButton].forEach { $0.translatesAutoresizingMaskIntoConstraints = false }
+        tipLabel.text = "Hold your device in a fixed position. Tilt or turn your hand as needed."  // (GCam's words)
+        tipLabel.textColor = UIColor.white.withAlphaComponent(0.85)
+        tipLabel.font = .systemFont(ofSize: 15, weight: .regular)
+        tipLabel.textAlignment = .center
+        tipLabel.numberOfLines = 0
+        view.addSubview(tipLabel)
+        [reticle, hintLabel, counterLabel, tipLabel, cancelButton, undoButton, doneButton].forEach { $0.translatesAutoresizingMaskIntoConstraints = false }
         let g = view.safeAreaLayoutGuide
         NSLayoutConstraint.activate([
             reticle.centerXAnchor.constraint(equalTo: view.centerXAnchor), reticle.centerYAnchor.constraint(equalTo: view.centerYAnchor),
@@ -140,6 +147,8 @@ final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelega
             hintLabel.topAnchor.constraint(equalTo: g.topAnchor, constant: 24), hintLabel.leadingAnchor.constraint(equalTo: g.leadingAnchor, constant: 24),
             hintLabel.trailingAnchor.constraint(equalTo: g.trailingAnchor, constant: -24),
             counterLabel.topAnchor.constraint(equalTo: hintLabel.bottomAnchor, constant: 8), counterLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            tipLabel.bottomAnchor.constraint(equalTo: cancelButton.topAnchor, constant: -20), tipLabel.leadingAnchor.constraint(equalTo: g.leadingAnchor, constant: 32),
+            tipLabel.trailingAnchor.constraint(equalTo: g.trailingAnchor, constant: -32),
             cancelButton.leadingAnchor.constraint(equalTo: g.leadingAnchor, constant: 20), cancelButton.bottomAnchor.constraint(equalTo: g.bottomAnchor, constant: -24),
             doneButton.trailingAnchor.constraint(equalTo: g.trailingAnchor, constant: -20), doneButton.bottomAnchor.constraint(equalTo: g.bottomAnchor, constant: -24),
             undoButton.centerXAnchor.constraint(equalTo: view.centerXAnchor), undoButton.bottomAnchor.constraint(equalTo: g.bottomAnchor, constant: -24),
@@ -330,8 +339,11 @@ final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelega
         let roll = Orient.fullRoll(R)
         let land = Self.within(roll, .pi / 2, .pi / 4) || Self.within(roll, -.pi / 2, .pi / 4)
         landscape = land
-        // the dots laid out by how the phone is held (GCam: landscape, the long side runs along the rings)
-        targets = land ? TargetManager(hfov: vfov, vfov: hfov) : TargetManager(hfov: hfov, vfov: vfov)
+        // the dots laid out by how the phone is held (GCam: landscape, the long side runs along the rings); "closer" lays
+        // them out as for a lens 18% narrower: about 46 photos instead of 32, smaller turns between neighbours
+        let k = UserDefaults.standard.bool(forKey: "closerDots") ? 0.82 : 1.0
+        targets = land ? TargetManager(hfov: vfov * k, vfov: hfov * k) : TargetManager(hfov: hfov * k, vfov: vfov * k)
+        tipLabel.isHidden = true
         overlay.clearDots()
         if let h = heading { session.setHeading(h) }
         takePhoto(rotation: R)
@@ -416,6 +428,7 @@ final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelega
         world.release()
         landscape = nil
         previewLayer?.isHidden = false
+        tipLabel.isHidden = false
         overlay.clearDots()
         overlay.clearPhotos()
         counterLabel.text = ""
