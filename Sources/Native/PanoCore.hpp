@@ -1237,10 +1237,14 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
             if ((int)inl.size() < kMinInliers || (int)inl.size() <= 5 + 0.15 * inView) continue;  // (INLIER_FAIL)
             if (!sensors && ((int)inl.size() < 12 || angleOf(Rvis * (b.Rp.t() * a.Rp).t()) > rad(kPriorAgreeDeg))) continue;  // (a chance match)
             if (sensors) {  // GEO_FAIL (GCam's VerifyMatchGeometry): the images' rotation against the sensors', in the world frame,
-                // per axis: 12.5 deg of tilt and of roll, 25 deg of yaw a step apart in capture order (65 at most)
+                // per axis: 12.5 deg of tilt and of roll, 25 deg of yaw a step apart in capture order (65 at most). GCam's
+                // allowances fit 2013 gyros and a matcher with a gradient gate; an iPhone's gyro is good to a few degrees and
+                // ORB lets more look-alikes through (the simulator's OpenCV placed a photo 15 deg off), so the whole
+                // discrepancy must also stay within 6 deg plus half a degree a step (25 at most)
                 Matx33d D = b.Rp * Rvis * a.Rp.t();
                 double ex = std::asin(clamp1(D(1, 2))), ey = std::atan2(D(0, 2), D(2, 2)), ez = std::atan2(D(1, 0), D(1, 1));
                 if (std::fabs(ex) > rad(12.5) || std::fabs(ez) > rad(12.5) || std::fabs(ey) > rad(std::min(25.0 * (j - i), 65.0))) continue;
+                if (angleOf(D) > rad(std::min(6.0 + 0.5 * (j - i), 25.0))) continue;
             }
             std::vector<cv::KeyPoint> kpsA;
             for (int k : inl) kpsA.push_back(a.kps[ka[k]]);
