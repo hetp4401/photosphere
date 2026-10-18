@@ -44,7 +44,6 @@ jobs:
           while read -r u; do [ -z "$u" ] && continue; i=$((i + 1)); curl -sL -A "Mozilla/5.0" -o "photos/$(printf %02d "$i").jpg" "$u"; done <<< "$ROOM_URLS"
           echo "$(ls photos | wc -l) photos"
           time ./harness stitch photos 1470 private/room.jpg 26 | tee private/room.txt
-          PANO_EXPOSURE=gain ./harness stitch photos 1470 private/room-gain.jpg 26 | tee private/room-gain.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with:

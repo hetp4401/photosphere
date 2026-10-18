@@ -37,6 +37,8 @@ final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelega
     private var heading: Double?
     private var finished = false
     private var countdownStart: CFTimeInterval?  // GCam's hold on the start dot (the reticle filling over 1.2 s)
+    private var skippedTooFast = false           // on a dot too fast to shoot (GCam: PhotoSkippedTooFast)
+    private var tooFastFrom = 0.0                // when to say so: 0.25 s after such a pass ends without a photo, for 0.75 s
     private let outline = CAShapeLayer()         // the camera's frame
     private let countdownLayer = CAShapeLayer()
 
@@ -175,6 +177,9 @@ final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelega
             self.captureSession.addInput(input)
             if self.captureSession.canAddOutput(self.photoOutput) { self.captureSession.addOutput(self.photoOutput) }
             self.photoOutput.maxPhotoQualityPrioritization = .balanced  // (the camera's own processing, as the Camera app)
+            if #available(iOS 17.0, *), self.photoOutput.isZeroShutterLagSupported {
+                self.photoOutput.isZeroShutterLagEnabled = true  // (the frame delivered is the one from the still moment that fired it)
+            }
             self.captureSession.commitConfiguration()
             self.device = dev
             // the lens's field of view: AVFoundation gives the sensor's horizontal one (its long side); as held in
@@ -235,21 +240,34 @@ final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelega
 
         if let targets {
             guard let near = targets.nearest(to: f, among: [.active]) else { return }
-            let (t, a) = near
-            overlay.syncDots(targets.targets, inRange: a < 15 * .pi / 180 ? t.id : nil, forward: f)
+            let (_, a) = near
+            // (GCam's GetTargetInRange: the nearest dot of any kind within 15 deg, highlighted only if it's still to take)
+            let any = targets.nearest(to: f, among: [.active, .inactive, .captured])
+            let inRange = any.flatMap { $0.1 < 15 * .pi / 180 && $0.0.state == .active ? $0.0.id : nil }
+            overlay.syncDots(targets.targets, inRange: inRange, forward: f)
+            let now = CACurrentMediaTime()
             if a < hit && canShoot {
                 if tooFast {
-                    hintLabel.text = "Hold still"
+                    skippedTooFast = true  // (GCam says nothing while on the dot)
                 } else if !rollOK {
                     hintLabel.text = "Keep the phone straight"
                 } else {
+                    skippedTooFast = false
+                    tooFastFrom = 0
                     takePhoto(rotation: R)
                 }
-            } else if photoInFlight {
-                hintLabel.text = "Hold still\u{2026}"
             } else {
-                hintLabel.text = a < 15 * .pi / 180 ? "Centre the dot" : "Turn to the next dot"
+                if skippedTooFast && !photoInFlight {  // (a pass over a dot ended without a photo)
+                    skippedTooFast = false
+                    tooFastFrom = now + 0.25
+                }
+                if photoInFlight {
+                    hintLabel.text = "Hold still\u{2026}"
+                } else {
+                    hintLabel.text = a < 15 * .pi / 180 ? "Centre the dot" : "Turn to the next dot"
+                }
             }
+            if tooFastFrom > 0 && now >= tooFastFrom && now < tooFastFrom + 0.75 { hintLabel.text = "Too fast. Slow down on the dot" }
         } else {
             let hitting = abs(pitch) < hit
             overlay.showFloatingDot(yaw: Orient.yaw(R), hit: hitting)
@@ -419,6 +437,15 @@ final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelega
     }
 
     @objc private func cancelTapped() {
+        guard session.count > 0 else { return leave() }
+        // (GCam asked before throwing a capture away)
+        let alert = UIAlertController(title: "Discard this photo sphere?", message: "The \(session.count) photos taken so far will be deleted.", preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "Keep shooting", style: .cancel))
+        alert.addAction(UIAlertAction(title: "Discard", style: .destructive) { _ in self.leave() })
+        present(alert, animated: true)
+    }
+
+    private func leave() {
         stop()
         session.discard()
         onCancel?()
@@ -426,6 +453,7 @@ final class CaptureViewController: UIViewController, AVCapturePhotoCaptureDelega
 
     private func finish() {
         guard !finished else { return }
+        UINotificationFeedbackGenerator().notificationOccurred(.success)  // (GCam played a sound when the capture was complete)
         stop()
         onFinished?(session)
     }

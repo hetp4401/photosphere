@@ -50,67 +50,6 @@ NSError *err(const std::string &msg) {
 @implementation PanoStitchResult
 @end
 
-@implementation PanoTracker {
-    std::unique_ptr<pano::LiveTracker> tracker_;
-}
-
-- (instancetype)initWithShortFovDeg:(double)shortFovDeg {
-    if ((self = [super init])) tracker_.reset(new pano::LiveTracker(shortFovDeg * M_PI / 180));
-    return self;
-}
-
-static cv::Mat grayFrom(UIImage *image) {
-    CGImageRef cg = image.CGImage;
-    if (!cg) return cv::Mat();
-    int w = (int)CGImageGetWidth(cg), h = (int)CGImageGetHeight(cg);
-    cv::Mat gray(h, w, CV_8UC1);
-    CGColorSpaceRef cs = CGColorSpaceCreateDeviceGray();
-    CGContextRef ctx = CGBitmapContextCreate(gray.data, w, h, 8, gray.step, cs, kCGImageAlphaNone);
-    if (ctx) {
-        CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), cg);
-        CGContextRelease(ctx);
-    }
-    CGColorSpaceRelease(cs);
-    return ctx ? gray : cv::Mat();
-}
-
-- (void)addKeyframe:(UIImage *)image rotation:(NSArray<NSNumber *> *)rotation {
-    cv::Mat g = grayFrom(image);
-    if (!g.empty()) tracker_->addKeyframe(g, matrixFrom(rotation));
-}
-
-- (void)removeLast {
-    tracker_->removeLast();
-}
-
-- (BOOL)track:(CVPixelBufferRef)buffer gyro:(NSArray<NSNumber *> *)gyro {
-    CVPixelBufferLockBaseAddress(buffer, kCVPixelBufferLock_ReadOnly);
-    cv::Mat gray;
-    OSType fmt = CVPixelBufferGetPixelFormatType(buffer);
-    if (fmt == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange || fmt == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange) {
-        gray = cv::Mat((int)CVPixelBufferGetHeightOfPlane(buffer, 0), (int)CVPixelBufferGetWidthOfPlane(buffer, 0), CV_8UC1,
-                       CVPixelBufferGetBaseAddressOfPlane(buffer, 0), CVPixelBufferGetBytesPerRowOfPlane(buffer, 0));
-    } else if (fmt == kCVPixelFormatType_32BGRA) {
-        cv::Mat bgra((int)CVPixelBufferGetHeight(buffer), (int)CVPixelBufferGetWidth(buffer), CV_8UC4, CVPixelBufferGetBaseAddress(buffer), CVPixelBufferGetBytesPerRow(buffer));
-        cv::cvtColor(bgra, gray, cv::COLOR_BGRA2GRAY);
-    }
-    int pts = 0;
-    double step = 0;
-    BOOL ok = !gray.empty() && tracker_->track(gray, matrixFrom(gyro), pts, step);
-    CVPixelBufferUnlockBaseAddress(buffer, kCVPixelBufferLock_ReadOnly);
-    return ok;
-}
-
-- (NSArray<NSNumber *> *)drift {
-    return arrayFrom(tracker_->drift());
-}
-
-- (double)driftDeg {
-    return pano::deg(pano::angleOf(tracker_->drift()));
-}
-
-@end
-
 @implementation PanoStitcher
 
 + (nullable PanoStitchResult *)stitchImages:(NSArray<NSString *> *)paths

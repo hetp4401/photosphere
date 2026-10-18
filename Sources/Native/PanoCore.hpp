@@ -82,7 +82,8 @@ constexpr double kLatGateDeg = 9.0;
 constexpr double kCycleDeg = 4.0;        // without a gyro, a pair is believed when a third photo closes the triangle within this
 constexpr int kStrongEdge = 40;          // ...or when it has this many inliers on its own
 constexpr double kSupportPx = 25.0;
-constexpr double kFocalPriorPx = 0.0;    // no pull on the focal (GCam: none; only the 10..150 deg FOV check after the solve)  // a weak pull of the focal toward the lens's: a phone turned at arm's length fits a longer one
+constexpr double kFocalPriorPx = 300.0;  // photos without a gyro: a weak pull of the focal toward the lens's (arm's-length turning
+                                         // fits a longer one); with a gyro none (GCam: none; only the 10..150 deg FOV check)  // a weak pull of the focal toward the lens's: a phone turned at arm's length fits a longer one
 constexpr double kPriorAgreeDeg = 10.0;  // without a gyro, a pair must agree with the verified placement within this      // ...and a photo stays when one of its matches holds within this after the adjustment
 constexpr double kGammaMax = 1.75;       // a photo's gamma at most (GCam: ComputeRosetteGammaAdjustment(.., 1.75))
 /// The exposure model: true, GCam's one gamma per photo (black and white stay put, so a photo exposed for a window keeps
@@ -309,82 +310,6 @@ bool refineDirect(const Small &a, const Small &b, Matx33d &Rji, double &before, 
     return conditioned && lastStep < 1e-3 && after <= before && angleOf(Rji * R0.t()) < rad(6);
 }
 
-/// Google Camera's tracker at capture time: the live preview, small and normalised, aligned to the nearest photo already
-/// taken (the tracker maths of refineDirect), and the gyro's drift corrected by what the camera sees, so the photos
-/// pasted on the sphere stay on the scene when the camera comes back to them. The correction is a world rotation that
-/// follows the tracker slowly (the gyro is smooth, the tracker noisy): corrected = drift * gyro.
-class LiveTracker {
-public:
-    explicit LiveTracker(double shortFovRad) : hfov_(shortFovRad) {}
-    static constexpr int kShort = 120;  // the small images' short side
-
-    void addKeyframe(const Mat &gray, const Matx33d &R) {  // (photos arrive on one thread, frames on another)
-        Key k;
-        k.fine = make(gray, 1.0);
-        k.coarse = make(gray, 0.5);
-        k.R = R;
-        std::lock_guard<std::mutex> lock(mutex_);
-        keys_.push_back(k);
-    }
-    void removeLast() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (!keys_.empty()) keys_.pop_back();
-    }
-    Matx33d drift() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return drift_;
-    }
-
-    /// A preview frame (upright, the photos' field of view) under the gyro's rotation: true when it aligned to a photo.
-    bool track(const Mat &frameGray, const Matx33d &Rgyro, int &points, double &stepDeg) {
-        points = 0;
-        stepDeg = 0;
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (keys_.empty()) return false;
-        Matx33d Rg = drift_ * Rgyro;  // (where the gyro says the camera is, corrected so far)
-        Vec3d f = forwardOf(Rg);
-        int best = -1;
-        double bestA = 1e9;
-        for (size_t k = 0; k < keys_.size(); k++) {
-            double a = angleBetween(f, forwardOf(keys_[k].R));
-            if (a < bestA) {
-                bestA = a;
-                best = (int)k;
-            }
-        }
-        if (best < 0 || bestA > rad(25)) return false;  // (not enough of a photo in view)
-        Small coarse = make(frameGray, 0.5), fine = make(frameGray, 1.0);
-        Matx33d Rji = keys_[best].R.t() * Rg;  // the photo's camera from the frame's
-        double before = 0, after = 0;
-        int pts = 0;
-        if (!refineDirect(coarse, keys_[best].coarse, Rji, before, after, pts)) return false;
-        if (!refineDirect(fine, keys_[best].fine, Rji, before, after, pts) || pts < 200) return false;
-        Matx33d Rvis = keys_[best].R * Rji;  // the frame by the pixels, world-from-camera
-        Matx33d step = Rvis * Rg.t();        // what the gyro is off by, in the world
-        double a = angleOf(step);
-        if (a > rad(8)) return false;  // (a wrong track)
-        drift_ = expSO3(logSO3(step) * 0.3) * drift_;
-        points = pts;
-        stepDeg = deg(a);
-        return true;
-    }
-
-private:
-    struct Key {
-        Small fine, coarse;
-        Matx33d R;
-    };
-    Small make(const Mat &gray, double rel) const {
-        int sh = std::min(gray.cols, gray.rows);
-        double f = (sh / 2.0) / std::tan(hfov_ / 2);  // (this image's focal, from the field of view)
-        return makeSmall(gray, f, rel * kShort / sh);
-    }
-    double hfov_;
-    mutable std::mutex mutex_;
-    std::vector<Key> keys_;
-    Matx33d drift_ = Matx33d::eye();
-};
-
 struct LineSeg {
     Point2d a, b;
     double len = 0;
@@ -571,6 +496,7 @@ struct BAProblem {
     double ws = 0;                   // the gravity priors' weight (GCam: 0.0125 * matches / images)
     std::vector<double> pitch0, roll0;
     bool fixFocal = false;           // the focal held (GCam's line pass)
+    double focalPriorPx = 0;         // the pull on the log focal (0: none)
 };
 
 void baRotations(const BAProblem &P, const std::vector<double> &x, std::vector<Matx33d> &R) {
@@ -610,7 +536,7 @@ void baResiduals(const BAProblem &P, const std::vector<double> &x, std::vector<d
             side(Rij, lm.j, lm.i, lm.aj, lm.bj, lm.ai, lm.bi);
         }
     }
-    if (kFocalPriorPx > 0) r.push_back(kFocalPriorPx * x[3 * P.n]);
+    if (P.focalPriorPx > 0) r.push_back(P.focalPriorPx * x[3 * P.n]);
     // the gravity priors, not robust (GCam: TrivialLoss): a sphere of 7 photos or more, the tilt only, as w f tan(error)
     // (SensorResidual); fewer, the tilt and the roll with half the weight, the roll not near a pole (RollPitchSensorResidual)
     for (int i = 0; i < P.n; i++) {
@@ -1382,11 +1308,15 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
     for (auto &p : pairs) keptPoints += (int)p.pi.size();
     // sensor pairs: a weak tie between each photo and the one before when no image match links them (GCam: SENSOR_PAIR,
     // a 3x3 grid transferred through the sensors, weight 0.125 or 0.25 when the axes are near)
-    std::vector<bool> needsLines(n, false);
+    // (GCam's match_success: a photo was matched against the ones taken before it as it came, so "matched" means matched
+    // an earlier photo; a tie is added when a photo or the one before it matched none of its predecessors)
+    std::vector<bool> needsLines(n, false), earlier(n, false);
+    for (auto &pm : pairs)
+        if (!pm.sensor) earlier[std::max(pm.i, pm.j)] = true;
     for (int i = 1; i < n && sensors; i++) {
         bool linked = std::find(matched[i].begin(), matched[i].end(), i - 1) != matched[i].end();
-        if (linked || (!matched[i].empty() && !matched[i - 1].empty())) continue;  // (GCam: only for a photo that matched nothing)
-        needsLines[i - 1] = needsLines[i] = true;
+        if (linked || (earlier[i] && (i < 2 || earlier[i - 1]))) continue;
+        needsLines[i - 1] = true;
         View &a = views[i - 1], &b = views[i];
         PairMatch pm;
         pm.i = i - 1;
@@ -1415,6 +1345,7 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
     P.f0 = fm;
     P.ws = keptPoints > 0 ? 0.0125 * keptPoints / n : 0.5;
     if (!sensors) P.ws *= 0.25;  // (the "gravity" came from the images: a weaker pull)
+    P.focalPriorPx = sensors ? 0 : kFocalPriorPx;
     std::vector<bool> dead(n, false);
     for (int i = 0; i < n; i++) {
         P.cxs.push_back(views[i].cx);
@@ -1615,43 +1546,30 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
             markCoverage(fullSize[i].width, fullSize[i].height, focalOf(i), (fullSize[i].width - 1) / 2.0, (fullSize[i].height - 1) / 2.0, R[i], probe, c);
         return c;
     };
-    Mat cov = coverProbe(), colAny;
-    cv::reduce(cov, colAny, 0, cv::REDUCE_MAX);
-    bool full = cv::countNonZero(colAny) == probe.W;
-    // the heading: a full circle has its first photo in the middle (GCam); a partial one is centred on what it covers,
-    // so it never straddles the +-180 line
+    // full circle (GCam's IsFullEquatorialPano(.., 10 deg)): some row within 10 deg of the horizon covered all the way round
+    auto isFull = [&](const Mat &c) {
+        Mat rowAll;
+        cv::reduce(c, rowAll, 1, cv::REDUCE_MIN);
+        for (int y = probe.H / 2 - probe.H / 18; y <= probe.H / 2 + probe.H / 18; y++)
+            if (rowAll.at<uchar>(y)) return true;
+        return false;
+    };
+    Mat cov = coverProbe();
+    bool full = isFull(cov);
+    // the heading (GCam's FUN_000d7424 and CenterPanoramaYaw): a full circle has its first photo in the middle; a partial
+    // one is turned so the photos' mean direction is in the middle (so it doesn't straddle the +-180 line)
     double shift = 0;
-    if (full) {
+    {
         Vec3d d = forwardOf(R[live[0]]);
-        shift = -std::atan2(d[0], d[2]);
-    } else {
-        int Wp = probe.W, start = 0, bestLen = 0, bestStart = 0, run = 0, runStart = 0;
-        while (start < Wp && !colAny.at<uchar>(start)) start++;
-        if (start == Wp) throw std::runtime_error("nothing covered");
-        for (int k = 1; k <= Wp; k++) {
-            int x = (start + k) % Wp;
-            if (colAny.at<uchar>(x)) {
-                run = 0;
-                continue;
-            }
-            if (run++ == 0) runStart = x;
-            if (run > bestLen) {
-                bestLen = run;
-                bestStart = runStart;
-            }
+        if (!full) {
+            d = Vec3d(0, 0, 0);
+            for (int i : live) d += forwardOf(R[i]);
         }
-        double mid = std::fmod(bestStart + bestLen / 2.0, (double)Wp);
-        shift = kPi - (mid / Wp * 2 * kPi - kPi);
+        shift = -std::atan2(d[0], d[2]);
     }
     Matx33d Ry(std::cos(shift), 0, std::sin(shift), 0, 1, 0, -std::sin(shift), 0, std::cos(shift));
     for (auto &Ri : R) Ri = Ry * Ri;
     cov = coverProbe();
-    {  // (islands under 0.5% of the sphere don't count: GCam's CreateRunLengthMinAreaMasker)
-        Mat labels, stats, cents;
-        int nl = cv::connectedComponentsWithStats(cov, labels, stats, cents, 8, CV_32S);
-        for (int l = 1; l < nl; l++)
-            if (stats.at<int>(l, cv::CC_STAT_AREA) < 0.005 * probe.W * probe.H) cov.setTo(0, labels == l);
-    }
     cv::Rect pb;
     if (full) {
         Mat rowAny, rowAll;
@@ -1672,20 +1590,15 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
         if (pb.area() < 1) throw std::runtime_error("nothing covered");
     }
     double budget = std::max(1.0, outputMegapixels) * 1e6;
-    int W = 2 * (int)std::lround(probe.W * std::sqrt(budget / (double)pb.area()) / 2.0);
-    double minMag = 1e9;  // (canvas pixels per photo pixel at the photos' centres: the smallest, when above 1, shrinks the canvas)
-    {
-        Equirect e(W);
-        for (int i : live) {
-            double f = focalOf(i), cx = (fullSize[i].width - 1) / 2.0, cy = (fullSize[i].height - 1) / 2.0;
-            Point2d p0 = e.pixel(R[i] * rayOf(cx, cy, f, cx, cy)), p1 = e.pixel(R[i] * rayOf(cx + 1, cy, f, cx, cy));
-            double dx = p1.x - p0.x;
-            if (dx > W / 2.0) dx -= W;
-            if (dx < -W / 2.0) dx += W;
-            minMag = std::min(minMag, std::hypot(dx, p1.y - p0.y));
-        }
+    int W = (int)(std::sqrt(budget / (double)pb.area()) * probe.W + 0.5);
+    W += W & 1;
+    double fMax = 0;  // (no photo enlarged: canvas pixels per photo pixel W / (2 pi f), the photos' focal along their long side)
+    for (int i : live) fMax = std::max(fMax, focalOf(i));
+    double mag = W / (2 * kPi * fMax);
+    if (mag > 1) {
+        W = (int)(W / mag);
+        W += W & 1;
     }
-    if (minMag > 1) W = 2 * (int)std::floor(W / minMag / 2.0);
     if (full) W -= W % 512;  // (a multiple of the blend distance, 2^(levels-1): the wrap blends like the rest)
     W = std::max(W, 1024);
     Equirect eq(W);
@@ -1696,6 +1609,8 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
         bounds = cv::Rect(0, y0, W, std::max(1, y1 - y0));
     } else {
         int x0 = (int)std::ceil(pb.x * toW), y0 = (int)std::ceil(pb.y * toW);
+        x0 += x0 & 1;  // (left and top even, as GCam's)
+        y0 += y0 & 1;
         int x1 = (int)std::floor((pb.x + pb.width) * toW), y1 = (int)std::floor((pb.y + pb.height) * toW);
         bounds = cv::Rect(x0, y0, std::max(1, x1 - x0), std::max(1, y1 - y0)) & cv::Rect(0, 0, eq.W, eq.H);
     }
@@ -1704,16 +1619,23 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
     report(0.6, "matching exposure");
     std::vector<double> gammas;
     double maxRatio = 1;
+    bool useGamma = gExposureGamma && sensors;  // (GCam's gamma for gyro captures; photos placed by the images alone keep gains)
     {
         std::vector<Mat> smalls(n);
         for (int i : live) cv::resize(mids[i], smalls[i], cv::Size(), 0.5, 0.5, cv::INTER_AREA);
-        if (gExposureGamma) matchExposure(smalls, R, fAdj * 0.25, gammas);
-        else gammas = matchGains(smalls, R, fAdj * 0.25, maxRatio);
+        if (useGamma) {
+            matchExposure(smalls, R, fAdj * 0.25, gammas);
+            for (int i : live)  // (a gamma at its clamp: the photos differ more than a gamma bridges; gains then)
+                if (std::fabs(gammas[i] - kGammaMax) < 1e-6 || std::fabs(gammas[i] - 1 / kGammaMax) < 1e-6) useGamma = false;
+        }
+        if (!useGamma) gammas = matchGains(smalls, R, fAdj * 0.25, maxRatio);
     }
     auto applyExposure = [&](Mat &img, double g) {
-        if (gExposureGamma) applyGamma(img, g);
+        if (useGamma) applyGamma(img, g);
         else applyGain(img, g);
     };
+    if (useGamma)  // (GCam blends in descending gamma: where two photos claim a pixel, the later wins)
+        std::stable_sort(live.begin(), live.end(), [&](int a, int b) { return gammas[a] > gammas[b]; });
 
     // ---- seams (GCam: graph cuts on a 512-wide mosaic): cut on about half a megapixel of the rendered rectangle
     report(0.64, "finding seams");
@@ -1862,7 +1784,7 @@ inline StitchResult stitch(const std::vector<std::string> &paths, const std::vec
         }
         char buf[360];
         snprintf(buf, sizeof buf, "%dx%d of a %dx%d sphere (%.1f MP, %.1f px/deg), compose scale %.2f, %s %.2f..%.2f (overlaps differed up to %.2fx), %d line matches, %d pairs rejected, %d dropped, %d pieces, %d bands",
-                 res.cropW, res.cropH, res.fullW, res.fullH, res.cropW * (double)res.cropH / 1e6, res.fullW / 360.0, composeScale, gExposureGamma ? "gammas" : "gains", gmin, gmax, maxRatio, lineMatches,
+                 res.cropW, res.cropH, res.fullW, res.fullH, res.cropW * (double)res.cropH / 1e6, res.fullW / 360.0, composeScale, useGamma ? "gammas" : "gains", gmin, gmax, maxRatio, lineMatches,
                  rejectedPairs, (int)res.dropped.size(), np, bands);
         res.notes = buf;
     }
